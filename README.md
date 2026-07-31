@@ -6,8 +6,10 @@ the Patreon post that contains it, so leaked links go stale fast.
 ## Setup
 
 ### 1. Fill in `config.py`
-- `MEGA_SOURCE_PATH` — the exact file path in your MEGA account to rotate
-  (must be a file, not a folder — check with `mega-ls`).
+- `MEGA_BASE_DIR` / `MEGA_FOLDER_NAMES` — your videos live in a folder
+  that alternates between `patreon-1` and `patreon-2` each rotation.
+  Before the first run, manually create `patreon-1` in your MEGA
+  account with your videos inside it.
 - `PATREON_POST_URL` — the post you always edit.
 - `SELECTORS` — see the next section. Don't guess these by hand; use
   codegen (below), it's much easier and far more reliable.
