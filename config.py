@@ -5,25 +5,51 @@
 # ==========================================================
 
 # --- MEGA settings ---
-# The remote path (in your MEGA account) of the FILE whose public share
-# link gets rotated. Must be a single file, not a folder, for the current
-# rotation logic (mega-cp/mega-mv on a file path). Find the exact path
-# via `mega-ls`.
-MEGA_SOURCE_PATH = "https://mega.nz/folder/1zwlQBAT#p0vvriYuhfpfzZkZ8bgd7w"
+# Your videos live in a folder that alternates between these two names
+# each rotation (patreon-1 -> patreon-2 -> patreon-1 -> ...). This
+# forces MEGA to treat it as a genuinely new folder each time (so the
+# link is guaranteed to actually change) and gives you an easy visual
+# check in the MEGA app that rotation happened.
+MEGA_BASE_DIR = "/Patreon Content"
+MEGA_FOLDER_NAMES = ["patreon-1", "patreon-2"]
+
+# Before the bot's first ever run, create MEGA_FOLDER_NAMES[0]
+# ("patreon-1") yourself with your videos inside it.
 
 # --- Patreon settings ---
 # The post you edit every rotation (the one containing the MEGA link).
-PATREON_POST_URL = "https://www.patreon.com/MinaValentine/posts/mega-link-test-165354775"
+PATREON_POST_URL = "https://www.patreon.com/posts/xxxxxxx"
 
-# CSS/data-tag selectors Playwright uses to find and edit the link
-# on the Patreon post editor page. Right-click -> Inspect on the
-# real page to get the current values — Patreon changes these
-# occasionally, so this is the main thing you'll need to update
-# if the bot starts failing.
+# CSS selectors Playwright uses to drive Patreon's post editor.
+# Captured via browser devtools "Copy selector" on the real page.
+#
+# WARNING: the Button-module__XXXXXX__ classnames contain a hash that
+# Patreon regenerates on redeploys. This is the single most likely
+# thing to break. When it does, re-capture with:
+#   playwright codegen https://www.patreon.com
 SELECTORS = {
-    "edit_button": ".Stack-module__Qen2pq__justifyContentCenter > div:nth-child(1) > div:nth-child(1) > div:nth-child(1) > div:nth-child(1) > div:nth-child(2) > div:nth-child(2) > div:nth-child(1) > div:nth-child(1) > div:nth-child(1) > div:nth-child(1) > div:nth-child(1) > div:nth-child(4) > button:nth-child(1) > div:nth-child(1) > div:nth-child(2) > div:nth-child(1)",   # opens the editor
-    "body_textbox": "div[data-tag='post-content-editor']",  # field containing the link
-    "save_button": "button[data-tag='post-save-button']",   # publishes the edit
+    # Opens the post editor
+    "edit_button": ".Stack-module__Qen2pq__justifyContentCenter > div:nth-child(1) > div:nth-child(1) > div:nth-child(1) > div:nth-child(1) > div:nth-child(2) > div:nth-child(2) > div:nth-child(1) > div:nth-child(1) > div:nth-child(1) > div:nth-child(1) > div:nth-child(1) > div:nth-child(4) > button:nth-child(1) > div:nth-child(1) > div:nth-child(2) > div:nth-child(1)",
+
+    # The 3-dot menu on the existing link content block
+    "block_menu_button": "#_r_i7_ > div:nth-child(1) > span:nth-child(1) > svg:nth-child(1)",
+
+    # "Delete" option inside that menu
+    # NOTE: this class is a generic text-align utility — if it matches
+    # more than one menu item, this is the first thing to fix.
+    "delete_option": ".TextLayoutBundle-module__IsQm8a__alignLeft",
+
+    # Confirm button in the "are you sure you want to delete" popup
+    "confirm_delete_button": ".Button-module__YRbc6a__themeCritical > div:nth-child(1) > div:nth-child(1)",
+
+    # "Link" option in the add-content picker that appears after delete
+    "link_option_button": "button.Button-module__YRbc6a__root:nth-child(4) > div:nth-child(1)",
+
+    # The field you type the new link into
+    "link_input_field": "#_r_g6_",
+
+    # Final button that saves/publishes the change
+    "update_button": "button.Button-module__YRbc6a__root:nth-child(5) > div:nth-child(1) > div:nth-child(1) > div:nth-child(1)",
 }
 
 # --- Scheduling ---
