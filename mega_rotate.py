@@ -1,69 +1,85 @@
 """
-Rotates a MEGA public share link.
+Rotates the MEGA public link by alternating your whole video folder
+between two names (patreon-1 <-> patreon-2), copying it to a fresh
+node each time.
 
-IMPORTANT — why this isn't just "disable export, re-enable export":
-A MEGA link is https://mega.nz/file/<handle>#<key>. Both the handle and
-the key belong to that specific file's node and do NOT change just from
-toggling the export status. So disabling and re-enabling the export on
-the SAME file would very likely hand back the exact same link — useless
-for rotation.
+Why alternate names instead of just re-exporting:
+A MEGA link is https://mega.nz/folder/<handle>#<key>. Both belong to
+that specific folder's node and do NOT change just from disabling and
+re-enabling the export -- so toggling export on the same folder would
+likely hand back the exact same link. Copying to a new folder gives
+it a new node (new handle), which guarantees a new link, and
+alternating names also makes it obvious at a glance in the MEGA app
+that a rotation actually happened.
 
-To get an actually different link, the file needs to become a different
-node. This does that WITHOUT re-uploading the video (slow, wastes
-bandwidth):
-
-  1. mega-cp:      server-side copy of the file to a temp name
-                    (new node -> will get a new handle/key when exported)
-  2. mega-export -d + mega-rm on the OLD file: kills the old export and
-     deletes the old node entirely, so the leaked link points at nothing
-  3. mega-mv:      rename the copy back to the canonical filename
-  4. mega-export -a: export the (now-renamed) file -> fresh link
-
-Nothing is deleted until step 1 has already succeeded, so a failed copy
-can't wipe out your only copy of the file.
+Flow each run:
+  1. Look at MEGA_BASE_DIR, figure out which of the two names is
+     currently active.
+  2. mega-cp -r: server-side copy the whole folder to the OTHER name.
+     If this fails, it raises and nothing below runs -- your videos
+     are untouched.
+  3. Only now is it safe to kill the old export + delete the old
+     folder (this is what makes the leaked link go dead).
+  4. mega-export -a on the new folder -> fresh link.
 
 Requires: megacmd installed and already logged in
 (`mega-login <email> <password>`) before this runs.
 
-STRONGLY RECOMMENDED: test this manually against a throwaway file first
-(not your real video) to confirm it behaves as expected on your account
-before trusting it with real content.
+STRONGLY RECOMMENDED: before pointing this at your real videos, test
+it against a throwaway folder with a couple of junk files, and confirm
+in the MEGA app that the old folder is really gone and the new one
+has everything.
 """
 
 import subprocess
 
-from config import MEGA_SOURCE_PATH
-
-TMP_SUFFIX = ".rotating.tmp"
+from config import MEGA_BASE_DIR, MEGA_FOLDER_NAMES
 
 
 def _run(cmd):
     return subprocess.run(cmd, check=True, capture_output=True, text=True)
 
 
+def _find_active_folder() -> str:
+    result = subprocess.run(
+        ["mega-ls", MEGA_BASE_DIR], capture_output=True, text=True
+    )
+    entries = [line.strip().rstrip("/") for line in result.stdout.splitlines() if line.strip()]
+
+    for name in MEGA_FOLDER_NAMES:
+        if name in entries:
+            return name
+
+    raise RuntimeError(
+        f"Neither {MEGA_FOLDER_NAMES} was found under {MEGA_BASE_DIR}. "
+        f"Before the first run, manually create {MEGA_FOLDER_NAMES[0]} "
+        "with your videos inside it."
+    )
+
+
 def rotate_mega_link() -> str:
-    tmp_path = MEGA_SOURCE_PATH + TMP_SUFFIX
+    active_name = _find_active_folder()
+    next_name = (
+        MEGA_FOLDER_NAMES[1] if active_name == MEGA_FOLDER_NAMES[0] else MEGA_FOLDER_NAMES[0]
+    )
 
-    # 1. Server-side copy to a new node. If this fails, it raises and
-    #    nothing below runs — the original file is untouched.
-    _run(["mega-cp", MEGA_SOURCE_PATH, tmp_path])
+    old_path = f"{MEGA_BASE_DIR}/{active_name}"
+    new_path = f"{MEGA_BASE_DIR}/{next_name}"
 
-    # 2. Now it's safe to retire the old node.
-    subprocess.run(["mega-export", "-d", MEGA_SOURCE_PATH], check=False)
-    subprocess.run(["mega-rm", MEGA_SOURCE_PATH], check=False)
+    # 1. Server-side copy the whole folder to a new node.
+    _run(["mega-cp", "-r", old_path, new_path])
 
-    # 3. Put the copy back at the canonical path/name.
-    _run(["mega-mv", tmp_path, MEGA_SOURCE_PATH])
+    # 2. Now safe to retire the old folder + its old export.
+    subprocess.run(["mega-export", "-d", old_path], check=False)
+    subprocess.run(["mega-rm", "-r", old_path], check=False)
 
-    # 4. Export it -> new link.
-    result = _run(["mega-export", "-a", MEGA_SOURCE_PATH])
+    # 3. Export the new folder -> fresh link.
+    result = _run(["mega-export", "-a", new_path])
     for line in result.stdout.splitlines():
         if "https://mega.nz" in line:
             return line.strip().split()[-1]
 
-    raise RuntimeError(
-        "Could not parse new MEGA link from mega-export output:\n" + result.stdout
-    )
+    raise RuntimeError("Could not parse new MEGA link from mega-export output:\n" + result.stdout)
 
 
 if __name__ == "__main__":
