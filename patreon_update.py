@@ -1,9 +1,21 @@
 """
-Opens your Patreon post editor (using a saved logged-in session)
-and swaps in the new MEGA link.
+Drives Patreon's post editor through the actual flow needed to swap
+the link (this UI doesn't support just retyping text over the old
+link — the old link block has to be deleted and a new one added):
 
-Selectors are pulled from config.py — update those if Patreon
-changes their editor's DOM and the bot starts failing.
+  1. Open the post editor
+  2. Open the 3-dot menu on the existing link block
+  3. Click "Delete"
+  4. Confirm the deletion in the popup that appears
+  5. Pick "Link" from the add-content option picker
+  6. Type the new URL into the link field
+  7. Wait for Patreon to fetch a link preview
+  8. Click the button that saves the change
+
+Selectors are pulled from config.py. If this stops working, the
+classnames with random-looking hashes (Button-module__XXXXXX__...)
+are the most likely culprit — Patreon regenerates those on redeploys.
+Recapture fresh ones with `playwright codegen https://www.patreon.com`.
 """
 
 import os
@@ -28,14 +40,36 @@ def update_patreon_link(new_link: str) -> None:
         page = context.new_page()
 
         page.goto(PATREON_POST_URL)
+
+        # 1. Open the post editor
         page.click(SELECTORS["edit_button"])
-        page.wait_for_selector(SELECTORS["body_textbox"])
+        page.wait_for_timeout(1500)
 
-        page.click(SELECTORS["body_textbox"])
-        page.keyboard.press("Control+A")
-        page.keyboard.type(new_link)
+        # 2. Open the 3-dot menu on the existing link block
+        page.click(SELECTORS["block_menu_button"])
+        page.wait_for_timeout(500)
 
-        page.click(SELECTORS["save_button"])
-        page.wait_for_timeout(2000)  # let the save request land
+        # 3. Click "Delete"
+        page.click(SELECTORS["delete_option"])
+        page.wait_for_timeout(500)
+
+        # 4. Confirm the deletion popup
+        page.click(SELECTORS["confirm_delete_button"])
+        page.wait_for_timeout(1000)
+
+        # 5. Choose "Link" from the add-content picker
+        page.click(SELECTORS["link_option_button"])
+        page.wait_for_timeout(500)
+
+        # 6. Type in the new link
+        page.click(SELECTORS["link_input_field"])
+        page.fill(SELECTORS["link_input_field"], new_link)
+
+        # 7. Give Patreon time to fetch a preview before saving
+        page.wait_for_timeout(3000)
+
+        # 8. Save
+        page.click(SELECTORS["update_button"])
+        page.wait_for_timeout(2000)
 
         browser.close()
