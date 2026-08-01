@@ -73,7 +73,9 @@ def rotate_mega_link() -> str:
     new_path = f"{MEGA_BASE_DIR}/{next_name}"
 
     # 1. Server-side copy the whole folder to a new node.
-    _run(["mega-cp", "-r", old_path, new_path])
+    #    Note: mega-cp has no -r flag — it copies folders recursively
+    #    by default. (mega-rm below DOES use -r, that one's correct.)
+    _run(["mega-cp", old_path, new_path])
 
     # 2. Now safe to retire the old folder + its old export.
     subprocess.run(["mega-export", "-d", old_path], check=False)
