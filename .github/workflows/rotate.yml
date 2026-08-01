@@ -41,3 +41,7 @@ jobs:
       - name: Logout of MEGA
         if: always()
         run: mega-logout
+
+      - name: Stop MEGAcmd server
+        if: always()
+        run: mega-quit || pkill -f mega-cmd-server || true
