@@ -37,7 +37,13 @@ from config import MEGA_BASE_DIR, MEGA_FOLDER_NAMES
 
 
 def _run(cmd):
-    return subprocess.run(cmd, check=True, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"Command failed: {' '.join(cmd)}", flush=True)
+        print(f"stdout: {result.stdout}", flush=True)
+        print(f"stderr: {result.stderr}", flush=True)
+        raise subprocess.CalledProcessError(result.returncode, cmd, result.stdout, result.stderr)
+    return result
 
 
 def _find_active_folder() -> str:
