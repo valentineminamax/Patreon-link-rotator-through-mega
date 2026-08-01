@@ -5,20 +5,20 @@
 # ==========================================================
 
 # --- MEGA settings ---
-# Your videos live in a folder that alternates between these two names
-# each rotation (patreon-1 -> patreon-2 -> patreon-1 -> ...). This
-# forces MEGA to treat it as a genuinely new folder each time (so the
-# link is guaranteed to actually change) and gives you an easy visual
-# check in the MEGA app that rotation happened.
+# Your link lives on the video folder itself (e.g. "patreon-1"),
+# inside a fixed outer folder (e.g. "Patreon Content"). Rotation
+# alternates the video folder's name between these two, copying it
+# to a fresh node each time so the link is guaranteed to change, then
+# deleting the old one entirely.
+#
+# No manual setup needed before the first run — your existing
+# "patreon-1" folder is used as-is.
 MEGA_BASE_DIR = "/Patreon Content"
 MEGA_FOLDER_NAMES = ["patreon-1", "patreon-2"]
 
-# Before the bot's first ever run, create MEGA_FOLDER_NAMES[0]
-# ("patreon-1") yourself with your videos inside it.
-
 # --- Patreon settings ---
 # The post you edit every rotation (the one containing the MEGA link).
-PATREON_POST_URL = "https://www.patreon.com/MinaValentine/posts/mega-link-test-165354775"
+PATREON_POST_URL = "https://www.patreon.com/posts/xxxxxxx"
 
 # CSS selectors Playwright uses to drive Patreon's post editor.
 # Captured via browser devtools "Copy selector" on the real page.
