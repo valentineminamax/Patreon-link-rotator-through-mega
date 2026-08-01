@@ -1,21 +1,21 @@
 """
-Rotates the MEGA public link by alternating your whole video folder
-between two names (patreon-1 <-> patreon-2), copying it to a fresh
-node each time.
+Rotates the MEGA public link by alternating your video folder
+(e.g. "patreon-1") between two names, copying it to a fresh node
+each time, inside a fixed outer folder (e.g. "Patreon Content").
 
 Why alternate names instead of just re-exporting:
 A MEGA link is https://mega.nz/folder/<handle>#<key>. Both belong to
 that specific folder's node and do NOT change just from disabling and
 re-enabling the export -- so toggling export on the same folder would
 likely hand back the exact same link. Copying to a new folder gives
-it a new node (new handle), which guarantees a new link, and
-alternating names also makes it obvious at a glance in the MEGA app
-that a rotation actually happened.
+it a new node (new handle), which guarantees a new link -- this is
+exactly why your manual process re-copies into a fresh folder each
+time rather than just re-sharing the same one.
 
 Flow each run:
-  1. Look at MEGA_BASE_DIR, figure out which of the two names is
+  1. Look inside MEGA_BASE_DIR, figure out which of the two names is
      currently active.
-  2. mega-cp -r: server-side copy the whole folder to the OTHER name.
+  2. mega-cp: server-side copy the whole folder to the OTHER name.
      If this fails, it raises and nothing below runs -- your videos
      are untouched.
   3. Only now is it safe to kill the old export + delete the old
@@ -26,9 +26,9 @@ Requires: megacmd installed and already logged in
 (`mega-login <email> <password>`) before this runs.
 
 STRONGLY RECOMMENDED: before pointing this at your real videos, test
-it against a throwaway folder with a couple of junk files, and confirm
-in the MEGA app that the old folder is really gone and the new one
-has everything.
+it against a throwaway folder with a couple of junk files, and
+confirm in the MEGA app that the old one is really gone and the new
+one has everything.
 """
 
 import subprocess
@@ -36,8 +36,8 @@ import subprocess
 from config import MEGA_BASE_DIR, MEGA_FOLDER_NAMES
 
 
-def _run(cmd):
-    result = subprocess.run(cmd, capture_output=True, text=True)
+def _run(cmd, stdin_input=None):
+    result = subprocess.run(cmd, capture_output=True, text=True, input=stdin_input, timeout=120)
     if result.returncode != 0:
         print(f"Command failed: {' '.join(cmd)}", flush=True)
         print(f"stdout: {result.stdout}", flush=True)
@@ -48,7 +48,7 @@ def _run(cmd):
 
 def _find_active_folder() -> str:
     result = subprocess.run(
-        ["mega-ls", MEGA_BASE_DIR], capture_output=True, text=True
+        ["mega-ls", MEGA_BASE_DIR], capture_output=True, text=True, timeout=60
     )
     entries = [line.strip().rstrip("/") for line in result.stdout.splitlines() if line.strip()]
 
@@ -58,8 +58,7 @@ def _find_active_folder() -> str:
 
     raise RuntimeError(
         f"Neither {MEGA_FOLDER_NAMES} was found under {MEGA_BASE_DIR}. "
-        f"Before the first run, manually create {MEGA_FOLDER_NAMES[0]} "
-        "with your videos inside it."
+        "Check the exact folder name/spelling in your MEGA account."
     )
 
 
@@ -72,17 +71,19 @@ def rotate_mega_link() -> str:
     old_path = f"{MEGA_BASE_DIR}/{active_name}"
     new_path = f"{MEGA_BASE_DIR}/{next_name}"
 
-    # 1. Server-side copy the whole folder to a new node.
+    # 1. Server-side copy the folder to a new node.
     #    Note: mega-cp has no -r flag — it copies folders recursively
     #    by default. (mega-rm below DOES use -r, that one's correct.)
     _run(["mega-cp", old_path, new_path])
 
     # 2. Now safe to retire the old folder + its old export.
-    subprocess.run(["mega-export", "-d", old_path], check=False)
-    subprocess.run(["mega-rm", "-r", old_path], check=False)
+    subprocess.run(["mega-export", "-d", old_path], capture_output=True, text=True, timeout=60)
+    subprocess.run(["mega-rm", "-r", old_path], capture_output=True, text=True, timeout=120)
 
     # 3. Export the new folder -> fresh link.
-    result = _run(["mega-export", "-a", new_path])
+    # stdin_input handles the one-time copyright confirmation prompt
+    # MEGA can show on an account's first-ever export.
+    result = _run(["mega-export", "-a", new_path], stdin_input="yes\n")
     for line in result.stdout.splitlines():
         if "https://mega.nz" in line:
             return line.strip().split()[-1]
