@@ -13,9 +13,11 @@ jobs:
 
       - name: Install MEGAcmd
         run: |
-          wget https://mega.nz/linux/repo/xUbuntu_22.04/amd64/megacmd-xUbuntu_22.04_amd64.deb
           sudo apt-get update
-          sudo apt-get install -y ./megacmd-xUbuntu_22.04_amd64.deb
+          sudo apt-get install -y wget gnupg lsb-release
+          UBUNTU_CODENAME=$(lsb_release -cs)
+          wget "https://mega.nz/linux/repo/xUbuntu_$(lsb_release -rs)/amd64/megacmd-xUbuntu_$(lsb_release -rs)_amd64.deb" -O megacmd.deb
+          sudo apt-get install -y ./megacmd.deb || sudo apt-get install -f -y
 
       - name: Set up Python
         uses: actions/setup-python@v5
