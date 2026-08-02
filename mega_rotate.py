@@ -50,6 +50,13 @@ def _find_active_folder() -> str:
     result = subprocess.run(
         ["mega-ls", MEGA_BASE_DIR], capture_output=True, text=True, timeout=60
     )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"mega-ls failed (exit {result.returncode}) — this usually means "
+            "you're not logged in (`mega-login`) or MEGAcmd isn't on PATH yet, "
+            f"not that the folders are missing.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+
     entries = [line.strip().rstrip("/") for line in result.stdout.splitlines() if line.strip()]
 
     for name in MEGA_FOLDER_NAMES:
@@ -58,6 +65,7 @@ def _find_active_folder() -> str:
 
     raise RuntimeError(
         f"Neither {MEGA_FOLDER_NAMES} was found under {MEGA_BASE_DIR}. "
+        f"mega-ls ran fine but returned these entries: {entries}. "
         "Check the exact folder name/spelling in your MEGA account."
     )
 
@@ -77,8 +85,17 @@ def rotate_mega_link() -> str:
     _run(["mega-cp", old_path, new_path])
 
     # 2. Now safe to retire the old folder + its old export.
-    subprocess.run(["mega-export", "-d", old_path], capture_output=True, text=True, timeout=60)
-    subprocess.run(["mega-rm", "-r", old_path], capture_output=True, text=True, timeout=120)
+    #    Not using _run() here on purpose (a failure to clean up the old
+    #    folder shouldn't crash the run when we already have a new link) —
+    #    but we still need to know if it happened, since a leaked link
+    #    that fails to die is the whole thing this bot exists to prevent.
+    export_d = subprocess.run(["mega-export", "-d", old_path], capture_output=True, text=True, timeout=60)
+    if export_d.returncode != 0:
+        print(f"WARNING: failed to disable export on {old_path}: {export_d.stderr}", flush=True)
+
+    rm_r = subprocess.run(["mega-rm", "-r", old_path], capture_output=True, text=True, timeout=120)
+    if rm_r.returncode != 0:
+        print(f"WARNING: failed to delete old folder {old_path}: {rm_r.stderr}", flush=True)
 
     # 3. Export the new folder -> fresh link.
     # stdin_input handles the one-time copyright confirmation prompt
