@@ -112,16 +112,25 @@ def rotate_mega_link() -> str:
     old_path = f"{MEGA_BASE_DIR}/{active_name}"
     new_path = f"{MEGA_BASE_DIR}/{next_name}"
 
+    print(f"Step 1/4: copying {old_path} -> {new_path} ...", flush=True)
     # 1. Server-side copy the folder to a new node.
     #    Note: mega-cp has no -r flag — it copies folders recursively
     #    by default. (mega-rm below DOES use -r, that one's correct.)
     _run(["mega-cp", old_path, new_path])
+    print("Step 1/4: copy done.", flush=True)
 
+    print(f"Step 2/4: disabling export on {old_path} ...", flush=True)
     # 2. Now safe to retire the old folder + its old export.
     #    "not exported" is a legitimate, harmless outcome (nothing to
     #    disable) -- anything else is unexpected and we stop rather
     #    than risk leaving a live link behind.
-    export_d = subprocess.run(["mega-export", "-d", old_path], capture_output=True, text=True, timeout=60)
+    #    Note: MEGA's official docs example shows -d does NOT prompt
+    #    for anything (unlike -a) -- it just disables and prints
+    #    immediately. The stdin below is harmless leftover insurance,
+    #    not believed to be doing anything on this call.
+    export_d = subprocess.run(
+        ["mega-export", "-d", old_path], capture_output=True, text=True, timeout=60, input="yes\n"
+    )
     combined = (export_d.stdout + export_d.stderr).lower()
     if export_d.returncode != 0 and "not exported" not in combined:
         raise RuntimeError(
@@ -129,7 +138,9 @@ def rotate_mega_link() -> str:
             f"refusing to continue since the old link may still be live.\n"
             f"stdout: {export_d.stdout}\nstderr: {export_d.stderr}"
         )
+    print("Step 2/4: export disabled (or already wasn't exported).", flush=True)
 
+    print(f"Step 3/4: deleting {old_path} ...", flush=True)
     rm_r = subprocess.run(["mega-rm", "-r", old_path], capture_output=True, text=True, timeout=120)
     if rm_r.returncode != 0:
         raise RuntimeError(
@@ -138,14 +149,24 @@ def rotate_mega_link() -> str:
             "folder is still sitting there and must be cleaned up manually before the "
             f"next run, or duplicates will pile up again.\nstderr: {rm_r.stderr}"
         )
+    print("Step 3/4: old folder deleted.", flush=True)
+    print("Step 4/4: generating new export link ...", flush=True)
 
     # 3. Export the new folder -> fresh link.
-    # stdin_input handles the one-time copyright confirmation prompt
-    # MEGA can show on an account's first-ever export.
-    result = _run(["mega-export", "-a", new_path], stdin_input="yes\n")
+    # MEGA's official docs show -a can trigger TWO separate sequential
+    # confirmation prompts on an account's first-ever export (a
+    # copyright-terms Yes/No, immediately followed by a second
+    # yes/no/all/none prompt) -- not just one. Piping only one "yes\n"
+    # answers the first prompt and then leaves the second one reading
+    # from an already-closed stdin, which is the leading suspect for
+    # the multi-minute hangs we saw. Piping several yes answers covers
+    # both known prompts plus margin for a third if there is one.
+    result = _run(["mega-export", "-a", new_path], stdin_input="yes\nyes\nyes\n")
     for line in result.stdout.splitlines():
         if "https://mega.nz" in line:
-            return line.strip().split()[-1]
+            link = line.strip().split()[-1]
+            print(f"Step 4/4: new link generated: {link}", flush=True)
+            return link
 
     raise RuntimeError("Could not parse new MEGA link from mega-export output:\n" + result.stdout)
 
