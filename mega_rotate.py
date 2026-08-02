@@ -141,7 +141,14 @@ def rotate_mega_link() -> str:
     print("Step 2/4: export disabled (or already wasn't exported).", flush=True)
 
     print(f"Step 3/4: deleting {old_path} ...", flush=True)
-    rm_r = subprocess.run(["mega-rm", "-r", old_path], capture_output=True, text=True, timeout=120)
+    # -f forces deletion without any confirmation prompt -- rm was the
+    # only one of our four mega-* calls with neither a force flag nor
+    # piped stdin, which lines up with it being the one that hung.
+    # (Deleted items still land in MEGA's Rubbish Bin by default, not
+    # permanently erased, so this stays safe/recoverable.)
+    rm_r = subprocess.run(
+        ["mega-rm", "-r", "-f", old_path], capture_output=True, text=True, timeout=120, input="yes\n"
+    )
     if rm_r.returncode != 0:
         raise RuntimeError(
             f"Failed to delete old folder {old_path} after the copy to {new_path} "
