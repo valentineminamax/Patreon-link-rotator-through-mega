@@ -8,6 +8,7 @@ on:
 jobs:
   rotate:
     runs-on: ubuntu-latest
+    timeout-minutes: 15   # hard ceiling for the whole job — nothing here should take this long
     steps:
       - uses: actions/checkout@v4
 
@@ -33,9 +34,11 @@ jobs:
         run: echo '${{ secrets.PATREON_SESSION_JSON }}' > patreon_session.json
 
       - name: Login to MEGA
+        timeout-minutes: 2   # this step has no timeout of its own in mega_rotate.py's control
         run: mega-login "${{ secrets.MEGA_EMAIL }}" "${{ secrets.MEGA_PASSWORD }}"
 
       - name: Run rotation
+        timeout-minutes: 5   # belt-and-suspenders on top of the 120s subprocess timeouts in code
         run: python main.py
 
       - name: Logout of MEGA
