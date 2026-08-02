@@ -5,16 +5,23 @@
 # ==========================================================
 
 # --- MEGA settings ---
-# Your link lives on the video folder itself (e.g. "patreon-1"),
-# inside a fixed outer folder (e.g. "Patreon Content"). Rotation
-# alternates the video folder's name between these two, copying it
-# to a fresh node each time so the link is guaranteed to change, then
-# deleting the old one entirely.
+# Your link lives on the video folder itself, inside a fixed outer
+# folder (e.g. "Patreon Content"). Every rotation copies that folder
+# to a brand new, timestamped name (e.g. "patreon-1754160000") so the
+# link is guaranteed to change, then deletes the old one entirely.
+#
+# There should only ever be ONE folder starting with FOLDER_PREFIX
+# under MEGA_BASE_DIR at a time. If mega_rotate.py ever finds more
+# than one, it stops and refuses to guess -- that means a previous
+# run's cleanup failed and needs a human to sort out manually before
+# rotating again (this happened once already from an old version of
+# this script that guessed instead of stopping -- don't reintroduce
+# that).
 #
 # No manual setup needed before the first run — your existing
-# "patreon-1" folder is used as-is.
+# "patreon-1" folder already matches this prefix and is used as-is.
 MEGA_BASE_DIR = "/Patreon Content"
-MEGA_FOLDER_NAMES = ["patreon-1", "patreon-2"]
+FOLDER_PREFIX = "patreon-"
 
 # --- Patreon settings ---
 # The post you edit every rotation (the one containing the MEGA link).
@@ -54,4 +61,4 @@ SELECTORS = {
 
 # --- Scheduling ---
 # Also update the cron expression in .github/workflows/rotate.yml to match.
-ROTATE_EVERY_HOURS = 15
+ROTATE_EVERY_HOURS = 4
