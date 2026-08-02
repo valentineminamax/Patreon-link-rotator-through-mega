@@ -1,25 +1,40 @@
 """
-Rotates the MEGA public link by alternating your video folder
-(e.g. "patreon-1") between two names, copying it to a fresh node
-each time, inside a fixed outer folder (e.g. "Patreon Content").
+Rotates the MEGA public link by copying your video folder to a
+freshly, uniquely named folder each run, inside a fixed outer folder
+(e.g. "Patreon Content").
 
-Why alternate names instead of just re-exporting:
+Why a fresh name instead of alternating between two fixed names:
 A MEGA link is https://mega.nz/folder/<handle>#<key>. Both belong to
 that specific folder's node and do NOT change just from disabling and
 re-enabling the export -- so toggling export on the same folder would
 likely hand back the exact same link. Copying to a new folder gives
-it a new node (new handle), which guarantees a new link -- this is
-exactly why your manual process re-copies into a fresh folder each
-time rather than just re-sharing the same one.
+it a new node (new handle), which guarantees a new link.
+
+An earlier version of this alternated between two fixed names
+("patreon-1" / "patreon-2"). That broke badly: if the old-folder
+cleanup step ever failed silently (which it did), both names would
+exist at once, the "find active folder" logic had no way to tell
+which one was actually current, and it kept picking the same stale
+one -- causing mega-cp to nest copies INSIDE the other folder instead
+of creating a clean new one, run after run. Timestamped names plus
+the single-folder invariant below close that hole: there is only ever
+one legal folder, and if that's ever violated, this script refuses to
+guess and stops instead of silently making a mess.
 
 Flow each run:
-  1. Look inside MEGA_BASE_DIR, figure out which of the two names is
-     currently active.
-  2. mega-cp: server-side copy the whole folder to the OTHER name.
-     If this fails, it raises and nothing below runs -- your videos
-     are untouched.
+  1. List MEGA_BASE_DIR. Exactly one folder starting with
+     FOLDER_PREFIX must exist -- that's "the active folder". If zero
+     or more than one exist, STOP and raise (see docstring on
+     _find_active_folder for why more-than-one is treated as fatal,
+     not "pick one").
+  2. mega-cp: server-side copy that whole folder to a brand new,
+     timestamped name. If this fails, it raises and nothing below
+     runs -- your videos are untouched.
   3. Only now is it safe to kill the old export + delete the old
-     folder (this is what makes the leaked link go dead).
+     folder (this is what makes the leaked link go dead). If this
+     step fails, we raise loudly rather than continue, because a
+     failed cleanup leaves the OLD link potentially still live, which
+     defeats the entire purpose of this bot.
   4. mega-export -a on the new folder -> fresh link.
 
 Requires: megacmd installed and already logged in
@@ -32,8 +47,9 @@ one has everything.
 """
 
 import subprocess
+import time
 
-from config import MEGA_BASE_DIR, MEGA_FOLDER_NAMES
+from config import MEGA_BASE_DIR, FOLDER_PREFIX
 
 
 def _run(cmd, stdin_input=None):
@@ -46,7 +62,7 @@ def _run(cmd, stdin_input=None):
     return result
 
 
-def _find_active_folder() -> str:
+def _list_base_dir() -> list[str]:
     result = subprocess.run(
         ["mega-ls", MEGA_BASE_DIR], capture_output=True, text=True, timeout=60
     )
@@ -54,27 +70,44 @@ def _find_active_folder() -> str:
         raise RuntimeError(
             f"mega-ls failed (exit {result.returncode}) — this usually means "
             "you're not logged in (`mega-login`) or MEGAcmd isn't on PATH yet, "
-            f"not that the folders are missing.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+            f"not that the folder is missing.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+    return [line.strip().rstrip("/") for line in result.stdout.splitlines() if line.strip()]
+
+
+def _find_active_folder() -> str:
+    entries = _list_base_dir()
+    candidates = [e for e in entries if e.startswith(FOLDER_PREFIX)]
+
+    if len(candidates) == 0:
+        raise RuntimeError(
+            f"No folder starting with '{FOLDER_PREFIX}' found under {MEGA_BASE_DIR}. "
+            f"mega-ls returned: {entries}. Check FOLDER_PREFIX in config.py."
         )
 
-    entries = [line.strip().rstrip("/") for line in result.stdout.splitlines() if line.strip()]
+    if len(candidates) > 1:
+        # This is the exact situation that caused nested duplicate
+        # copies before: a previous run's cleanup step failed and left
+        # a stale folder behind. Guessing which one is "real" here
+        # risks corrupting things further -- stop and make the human
+        # look, instead.
+        raise RuntimeError(
+            f"Found {len(candidates)} folders matching '{FOLDER_PREFIX}*' under "
+            f"{MEGA_BASE_DIR}: {candidates}. This means a previous run's cleanup "
+            "step failed and left an old folder behind -- rotating again right now "
+            "would risk creating nested duplicate copies instead of a clean rotation "
+            "(this has happened before). Manually check the MEGA app: confirm which "
+            "folder has the real current content, delete the stale one(s) yourself, "
+            "and double-check none of them still has a live export "
+            "(`mega-export -s <path>`) before re-running."
+        )
 
-    for name in MEGA_FOLDER_NAMES:
-        if name in entries:
-            return name
-
-    raise RuntimeError(
-        f"Neither {MEGA_FOLDER_NAMES} was found under {MEGA_BASE_DIR}. "
-        f"mega-ls ran fine but returned these entries: {entries}. "
-        "Check the exact folder name/spelling in your MEGA account."
-    )
+    return candidates[0]
 
 
 def rotate_mega_link() -> str:
     active_name = _find_active_folder()
-    next_name = (
-        MEGA_FOLDER_NAMES[1] if active_name == MEGA_FOLDER_NAMES[0] else MEGA_FOLDER_NAMES[0]
-    )
+    next_name = f"{FOLDER_PREFIX}{int(time.time())}"
 
     old_path = f"{MEGA_BASE_DIR}/{active_name}"
     new_path = f"{MEGA_BASE_DIR}/{next_name}"
@@ -85,17 +118,26 @@ def rotate_mega_link() -> str:
     _run(["mega-cp", old_path, new_path])
 
     # 2. Now safe to retire the old folder + its old export.
-    #    Not using _run() here on purpose (a failure to clean up the old
-    #    folder shouldn't crash the run when we already have a new link) —
-    #    but we still need to know if it happened, since a leaked link
-    #    that fails to die is the whole thing this bot exists to prevent.
+    #    "not exported" is a legitimate, harmless outcome (nothing to
+    #    disable) -- anything else is unexpected and we stop rather
+    #    than risk leaving a live link behind.
     export_d = subprocess.run(["mega-export", "-d", old_path], capture_output=True, text=True, timeout=60)
-    if export_d.returncode != 0:
-        print(f"WARNING: failed to disable export on {old_path}: {export_d.stderr}", flush=True)
+    combined = (export_d.stdout + export_d.stderr).lower()
+    if export_d.returncode != 0 and "not exported" not in combined:
+        raise RuntimeError(
+            f"Failed to disable export on {old_path} for an unexpected reason -- "
+            f"refusing to continue since the old link may still be live.\n"
+            f"stdout: {export_d.stdout}\nstderr: {export_d.stderr}"
+        )
 
     rm_r = subprocess.run(["mega-rm", "-r", old_path], capture_output=True, text=True, timeout=120)
     if rm_r.returncode != 0:
-        print(f"WARNING: failed to delete old folder {old_path}: {rm_r.stderr}", flush=True)
+        raise RuntimeError(
+            f"Failed to delete old folder {old_path} after the copy to {new_path} "
+            "already succeeded -- your fresh copy and content are safe, but the OLD "
+            "folder is still sitting there and must be cleaned up manually before the "
+            f"next run, or duplicates will pile up again.\nstderr: {rm_r.stderr}"
+        )
 
     # 3. Export the new folder -> fresh link.
     # stdin_input handles the one-time copyright confirmation prompt
