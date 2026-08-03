@@ -63,16 +63,7 @@ def update_patreon_link(new_link: str) -> None:
 
 
 def _run_update_flow(page, new_link: str) -> None:
-    # Create the ClickSolver BEFORE navigating – important for detection
-    solver = ClickSolver(
-        captcha_type=CaptchaType.CLOUDFLARE_TURNSTILE,   # <-- CORRECT enum
-        framework=FrameworkType.PLAYWRIGHT,
-        headless=True,
-        timeout=60000,
-        debug=False,
-    )
-
-    # Navigate to the post
+    # Navigate to the post first
     page.goto(PATREON_POST_URL, wait_until="domcontentloaded")
     time.sleep(2)
 
@@ -80,13 +71,21 @@ def _run_update_flow(page, new_link: str) -> None:
     if "Just a moment..." in page.title() or "Checking your browser" in page.title():
         print("Cloudflare challenge detected. Attempting to bypass...", flush=True)
         try:
-            solved = solver.solve_sync(page)
-            if solved:
-                print("Cloudflare challenge solved successfully.", flush=True)
-                page.wait_for_load_state("networkidle", timeout=30000)
-                time.sleep(3)
-            else:
-                raise RuntimeError("ClickSolver returned False – challenge not solved.")
+            # Create solver AFTER navigation, with the page
+            solver = ClickSolver(
+                framework=FrameworkType.PLAYWRIGHT,
+                page=page,
+                max_attempts=5,
+                attempt_delay=3
+            )
+            # Now solve the captcha
+            solver.solve_captcha(
+                captcha_container=page,
+                captcha_type=CaptchaType.CLOUDFLARE_TURNSTILE
+            )
+            print("Cloudflare challenge solved successfully.", flush=True)
+            page.wait_for_load_state("networkidle", timeout=30000)
+            time.sleep(3)
         except Exception as e:
             # Save the challenge page for debugging
             with open("cloudflare_challenge.html", "w", encoding="utf-8") as f:
