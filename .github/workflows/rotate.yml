@@ -47,6 +47,11 @@ jobs:
 
       - name: Run rotation
         timeout-minutes: 5   # belt-and-suspenders on top of the 120s subprocess timeouts in code
+        env:
+             PROXY_HOST: ${{ secrets.PROXY_HOST }}
+             PROXY_PORT: ${{ secrets.PROXY_PORT }}
+             PROXY_USERNAME: ${{ secrets.PROXY_USERNAME }}
+             PROXY_PASSWORD: ${{ secrets.PROXY_PASSWORD }}
         run: python main.py
 
       - name: Upload Patreon failure evidence
