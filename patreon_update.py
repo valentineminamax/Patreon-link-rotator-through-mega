@@ -65,11 +65,11 @@ def update_patreon_link(new_link: str) -> None:
 def _run_update_flow(page, new_link: str) -> None:
     # Create the ClickSolver BEFORE navigating – important for detection
     solver = ClickSolver(
-        captcha_type=CaptchaType.CLOUDFLARE,
+        captcha_type=CaptchaType.TURNSTILE,   # <-- FIXED: use TURNSTILE for Cloudflare
         framework=FrameworkType.PLAYWRIGHT,
-        headless=True,               # Runs in headless mode
-        timeout=60000,               # 60 seconds to solve
-        debug=False,                 # Set to True to see logs
+        headless=True,
+        timeout=60000,
+        debug=False,
     )
 
     # Navigate to the post
@@ -93,7 +93,7 @@ def _run_update_flow(page, new_link: str) -> None:
                 f.write(page.content())
             raise RuntimeError(f"Cloudflare bypass failed: {e}")
 
-    # ---- Normal Patreon update flow (unchanged) ----
+    # ---- Normal Patreon update flow ----
     # 1. Open the post editor
     page.get_by_role("button", name="Edit").click(timeout=60000)
     page.wait_for_timeout(1500)
