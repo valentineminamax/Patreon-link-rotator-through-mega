@@ -65,7 +65,7 @@ def update_patreon_link(new_link: str) -> None:
 def _run_update_flow(page, new_link: str) -> None:
     # Create the ClickSolver BEFORE navigating – important for detection
     solver = ClickSolver(
-        captcha_type=CaptchaType.TURNSTILE,   # <-- FIXED: use TURNSTILE for Cloudflare
+        captcha_type=CaptchaType.CLOUDFLARE_TURNSTILE,   # <-- CORRECT enum
         framework=FrameworkType.PLAYWRIGHT,
         headless=True,
         timeout=60000,
