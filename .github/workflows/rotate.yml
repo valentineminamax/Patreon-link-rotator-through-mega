@@ -27,8 +27,8 @@ jobs:
 
       - name: Install Python dependencies
         run: |
-          pip install playwright playwright-captcha
-          playwright install --with-deps chromium
+          pip install patchright playwright-captcha
+          patchright install --with-deps chromium
 
       - name: Restore Patreon session
         # NOTE: previously `echo '${{ secrets.PATREON_SESSION_JSON }}' > file`.
