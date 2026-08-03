@@ -46,6 +46,31 @@ def update_patreon_link(new_link: str) -> None:
         context = browser.new_context(storage_state=STORAGE_STATE_PATH)
         page = context.new_page()
 
+        try:
+            _run_update_flow(page, new_link)
+        except Exception:
+            # Capture direct visual evidence of what the page actually
+            # looked like at the moment of failure -- e.g. a login page
+            # (session didn't restore) vs. the real post in a broken
+            # state (selector issue) vs. something else entirely. Saved
+            # here so rotate.yml can upload them as a downloadable
+            # artifact on failure, instead of us having to guess from
+            # a traceback alone.
+            try:
+                page.screenshot(path="patreon_failure.png", full_page=True)
+            except Exception as screenshot_err:
+                print(f"Could not capture failure screenshot: {screenshot_err}", flush=True)
+            try:
+                with open("patreon_failure.html", "w", encoding="utf-8") as f:
+                    f.write(page.content())
+            except Exception as html_err:
+                print(f"Could not capture failure HTML: {html_err}", flush=True)
+            raise
+        finally:
+            browser.close()
+
+
+def _run_update_flow(page, new_link: str) -> None:
         page.goto(PATREON_POST_URL)
 
         # 1. Open the post editor
@@ -112,5 +137,3 @@ def update_patreon_link(new_link: str) -> None:
         # classname family as above.
         page.get_by_role("button", name="Update").click()
         page.wait_for_timeout(2000)
-
-        browser.close()
