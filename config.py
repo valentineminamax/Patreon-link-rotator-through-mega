@@ -25,7 +25,7 @@ FOLDER_PREFIX = "patreon-"
 
 # --- Patreon settings ---
 # The post you edit every rotation (the one containing the MEGA link).
-PATREON_POST_URL = "https://www.patreon.com/posts/xxxxxxx"
+PATREON_POST_URL = "https://www.patreon.com/MinaValentine/posts/mega-link-test-165354775?utm_medium=clipboard_copy&utm_source=copyLink&utm_campaign=postshare_creator&utm_content=join_link"
 
 # CSS selectors Playwright uses to drive Patreon's post editor.
 # Captured via browser devtools "Copy selector" on the real page.
