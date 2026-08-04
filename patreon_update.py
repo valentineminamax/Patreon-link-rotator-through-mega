@@ -60,11 +60,14 @@ async def update_patreon_link(new_link: str) -> None:
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/151.0.0.0 Safari/537.36"
             ),
-            proxy=proxy_config,          # <-- ONLY the browser uses this
+            proxy=proxy_config,
             locale="en-US",
             timezone_id="America/New_York",
         )
         page = await context.new_page()
+
+        # Set a default timeout for all actions (60 seconds)
+        page.set_default_timeout(60000)
 
         try:
             await _run_update_flow(page, new_link)
@@ -84,12 +87,14 @@ async def update_patreon_link(new_link: str) -> None:
 
 
 async def _run_update_flow(page, new_link: str) -> None:
-    await page.goto(PATREON_POST_URL, wait_until="domcontentloaded")
+    # Navigate to the post with a longer timeout (90 seconds)
+    await page.goto(PATREON_POST_URL, wait_until="domcontentloaded", timeout=90000)
     await asyncio.sleep(3)
 
     title = await page.title()
     print(f"Page title: {title}", flush=True)
 
+    # Check for Cloudflare challenge – only if it appears
     if "Just a moment..." in title or "Checking your browser" in title:
         print("Cloudflare challenge detected. Attempting to bypass...", flush=True)
 
@@ -125,23 +130,23 @@ async def _run_update_flow(page, new_link: str) -> None:
     await page.get_by_role("button", name="Edit").click(timeout=60000)
     await page.wait_for_timeout(1500)
 
-    await page.get_by_role("button", name="Menu for additional actions").click(timeout=30000)
+    await page.get_by_role("button", name="Menu for additional actions").click(timeout=60000)
     await page.wait_for_timeout(500)
 
-    await page.get_by_role("menuitem", name="Delete").click(timeout=30000)
+    await page.get_by_role("menuitem", name="Delete").click(timeout=60000)
     await page.wait_for_timeout(500)
 
-    await page.get_by_role("button", name="Delete").click(timeout=30000)
+    await page.get_by_role("button", name="Delete").click(timeout=60000)
     await page.wait_for_timeout(1000)
 
-    await page.locator("button").filter(has_text="Link").click(timeout=30000)
+    await page.locator("button").filter(has_text="Link").click(timeout=60000)
     await page.wait_for_timeout(500)
 
     link_input = page.get_by_role("textbox", name="Type or paste URL")
-    await link_input.click(timeout=30000)
+    await link_input.click(timeout=60000)
     await link_input.fill(new_link)
 
     await page.wait_for_timeout(3000)
 
-    await page.get_by_role("button", name="Update").click(timeout=30000)
+    await page.get_by_role("button", name="Update").click(timeout=60000)
     await page.wait_for_timeout(2000)
