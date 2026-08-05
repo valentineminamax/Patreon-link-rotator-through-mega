@@ -1,49 +1,7 @@
 """
-Rotates the MEGA public link by copying your video folder to a
-freshly, uniquely named folder each run, inside a fixed outer folder
-(e.g. "Patreon Content").
-
-Why a fresh name instead of alternating between two fixed names:
-A MEGA link is https://mega.nz/folder/<handle>#<key>. Both belong to
-that specific folder's node and do NOT change just from disabling and
-re-enabling the export -- so toggling export on the same folder would
-likely hand back the exact same link. Copying to a new folder gives
-it a new node (new handle), which guarantees a new link.
-
-An earlier version of this alternated between two fixed names
-("patreon-1" / "patreon-2"). That broke badly: if the old-folder
-cleanup step ever failed silently (which it did), both names would
-exist at once, the "find active folder" logic had no way to tell
-which one was actually current, and it kept picking the same stale
-one -- causing mega-cp to nest copies INSIDE the other folder instead
-of creating a clean new one, run after run. Timestamped names plus
-the single-folder invariant below close that hole: there is only ever
-one legal folder, and if that's ever violated, this script refuses to
-guess and stops instead of silently making a mess.
-
-Flow each run:
-  1. List MEGA_BASE_DIR. Exactly one folder starting with
-     FOLDER_PREFIX must exist -- that's "the active folder". If zero
-     or more than one exist, STOP and raise (see docstring on
-     _find_active_folder for why more-than-one is treated as fatal,
-     not "pick one").
-  2. mega-cp: server-side copy that whole folder to a brand new,
-     timestamped name. If this fails, it raises and nothing below
-     runs -- your videos are untouched.
-  3. Only now is it safe to kill the old export + delete the old
-     folder (this is what makes the leaked link go dead). If this
-     step fails, we raise loudly rather than continue, because a
-     failed cleanup leaves the OLD link potentially still live, which
-     defeats the entire purpose of this bot.
-  4. mega-export -a on the new folder -> fresh link.
-
-Requires: megacmd installed and already logged in
-(`mega-login <email> <password>`) before this runs.
-
-STRONGLY RECOMMENDED: before pointing this at your real videos, test
-it against a throwaway folder with a couple of junk files, and
-confirm in the MEGA app that the old one is really gone and the new
-one has everything.
+Rotates the MEGA public link – with automatic rollback.
+If Patreon update fails, the newly created folder is deleted so the old
+link stays active.
 """
 
 import subprocess
@@ -75,9 +33,26 @@ def _list_base_dir() -> list[str]:
     return [line.strip().rstrip("/") for line in result.stdout.splitlines() if line.strip()]
 
 
-def _find_active_folder() -> str:
+def _extract_timestamp(name: str) -> int:
+    """Extract timestamp from folder name like 'patreon-1785868385'."""
+    try:
+        return int(name.replace(FOLDER_PREFIX, ""))
+    except ValueError:
+        return 0
+
+
+def _find_and_cleanup_active_folder() -> tuple[str, str | None]:
+    """
+    Finds the active folder. If there are two, determines which is old/new,
+    deletes the old one (since the new one was already created by a previous
+    run that crashed after Patreon update), and returns the new one.
+    Returns: (active_folder_name, old_folder_name_that_was_deleted_or_None)
+    """
     entries = _list_base_dir()
-    candidates = [e for e in entries if e.startswith(FOLDER_PREFIX)]
+    candidates = sorted(
+        [e for e in entries if e.startswith(FOLDER_PREFIX)],
+        key=_extract_timestamp
+    )
 
     if len(candidates) == 0:
         raise RuntimeError(
@@ -85,51 +60,80 @@ def _find_active_folder() -> str:
             f"mega-ls returned: {entries}. Check FOLDER_PREFIX in config.py."
         )
 
-    if len(candidates) > 1:
-        # This is the exact situation that caused nested duplicate
-        # copies before: a previous run's cleanup step failed and left
-        # a stale folder behind. Guessing which one is "real" here
-        # risks corrupting things further -- stop and make the human
-        # look, instead.
+    if len(candidates) == 1:
+        return candidates[0], None
+
+    # Two or more folders – this means a previous run created a new folder
+    # but crashed before deleting the old one.
+    # The one with the largest timestamp is the newest.
+    active_name = candidates[-1]
+    old_name = candidates[-2]  # The second-newest is the one to delete
+
+    old_path = f"{MEGA_BASE_DIR}/{old_name}"
+
+    print(f"⚠️ Found {len(candidates)} folders matching '{FOLDER_PREFIX}*' – "
+          f"this means a previous run crashed mid-operation.", flush=True)
+    print(f"   Newer: {active_name} (will keep)", flush=True)
+    print(f"   Older: {old_name} (will delete)", flush=True)
+
+    # Disable export on the old folder (if it has one)
+    print(f"   Disabling export on {old_path} ...", flush=True)
+    export_d = subprocess.run(
+        ["mega-export", "-d", old_path],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        input="yes\n"
+    )
+    if export_d.returncode != 0 and "not exported" not in (export_d.stdout + export_d.stderr).lower():
+        print(f"   WARNING: Could not disable export on {old_path} – continuing anyway.", flush=True)
+
+    # Delete the old folder
+    print(f"   Deleting old folder {old_path} ...", flush=True)
+    rm_r = subprocess.run(
+        ["mega-rm", "-r", "-f", old_path],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        input="yes\n"
+    )
+    if rm_r.returncode != 0:
         raise RuntimeError(
-            f"Found {len(candidates)} folders matching '{FOLDER_PREFIX}*' under "
-            f"{MEGA_BASE_DIR}: {candidates}. This means a previous run's cleanup "
-            "step failed and left an old folder behind -- rotating again right now "
-            "would risk creating nested duplicate copies instead of a clean rotation "
-            "(this has happened before). Manually check the MEGA app: confirm which "
-            "folder has the real current content, delete the stale one(s) yourself, "
-            "and double-check none of them still has a live export "
-            "(`mega-export -s <path>`) before re-running."
+            f"Failed to delete old folder {old_path} during recovery.\n"
+            f"stderr: {rm_r.stderr}\n"
+            "This folder must be manually deleted before the bot can continue."
         )
+    print(f"   ✅ Deleted old folder {old_name}.", flush=True)
 
-    return candidates[0]
+    return active_name, old_name
 
 
-def rotate_mega_link() -> str:
-    active_name = _find_active_folder()
+def rotate_mega_link() -> tuple[str, str, str]:
+    """
+    Returns: (new_link, old_path, new_path)
+    - old_path: folder to delete if Patreon update succeeds
+    - new_path: folder to delete if Patreon update fails (rollback)
+    """
+    # First, check if we need to recover from a previous crash
+    active_name, deleted_name = _find_and_cleanup_active_folder()
+
+    # Now proceed with the normal rotation flow
     next_name = f"{FOLDER_PREFIX}{int(time.time())}"
 
     old_path = f"{MEGA_BASE_DIR}/{active_name}"
     new_path = f"{MEGA_BASE_DIR}/{next_name}"
 
     print(f"Step 1/4: copying {old_path} -> {new_path} ...", flush=True)
-    # 1. Server-side copy the folder to a new node.
-    #    Note: mega-cp has no -r flag — it copies folders recursively
-    #    by default. (mega-rm below DOES use -r, that one's correct.)
     _run(["mega-cp", old_path, new_path])
     print("Step 1/4: copy done.", flush=True)
 
     print(f"Step 2/4: disabling export on {old_path} ...", flush=True)
-    # 2. Now safe to retire the old folder + its old export.
-    #    "not exported" is a legitimate, harmless outcome (nothing to
-    #    disable) -- anything else is unexpected and we stop rather
-    #    than risk leaving a live link behind.
-    #    Note: MEGA's official docs example shows -d does NOT prompt
-    #    for anything (unlike -a) -- it just disables and prints
-    #    immediately. The stdin below is harmless leftover insurance,
-    #    not believed to be doing anything on this call.
     export_d = subprocess.run(
-        ["mega-export", "-d", old_path], capture_output=True, text=True, timeout=60, input="yes\n"
+        ["mega-export", "-d", old_path],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        input="yes\n"
     )
     combined = (export_d.stdout + export_d.stderr).lower()
     if export_d.returncode != 0 and "not exported" not in combined:
@@ -140,42 +144,18 @@ def rotate_mega_link() -> str:
         )
     print("Step 2/4: export disabled (or already wasn't exported).", flush=True)
 
-    print(f"Step 3/4: deleting {old_path} ...", flush=True)
-    # -f forces deletion without any confirmation prompt -- rm was the
-    # only one of our four mega-* calls with neither a force flag nor
-    # piped stdin, which lines up with it being the one that hung.
-    # (Deleted items still land in MEGA's Rubbish Bin by default, not
-    # permanently erased, so this stays safe/recoverable.)
-    rm_r = subprocess.run(
-        ["mega-rm", "-r", "-f", old_path], capture_output=True, text=True, timeout=120, input="yes\n"
-    )
-    if rm_r.returncode != 0:
-        raise RuntimeError(
-            f"Failed to delete old folder {old_path} after the copy to {new_path} "
-            "already succeeded -- your fresh copy and content are safe, but the OLD "
-            "folder is still sitting there and must be cleaned up manually before the "
-            f"next run, or duplicates will pile up again.\nstderr: {rm_r.stderr}"
-        )
-    print("Step 3/4: old folder deleted.", flush=True)
-    print("Step 4/4: generating new export link ...", flush=True)
-
-    # 3. Export the new folder -> fresh link.
-    # MEGA's official docs show -a can trigger TWO separate sequential
-    # confirmation prompts on an account's first-ever export (a
-    # copyright-terms Yes/No, immediately followed by a second
-    # yes/no/all/none prompt) -- not just one. Piping only one "yes\n"
-    # answers the first prompt and then leaves the second one reading
-    # from an already-closed stdin, which is the leading suspect for
-    # the multi-minute hangs we saw. Piping several yes answers covers
-    # both known prompts plus margin for a third if there is one.
+    print("Step 3/4: generating new export link ...", flush=True)
     result = _run(["mega-export", "-a", new_path], stdin_input="yes\nyes\nyes\n")
     for line in result.stdout.splitlines():
         if "https://mega.nz" in line:
             link = line.strip().split()[-1]
-            print(f"Step 4/4: new link generated: {link}", flush=True)
-            return link
+            print(f"Step 3/4: new link generated: {link}", flush=True)
+            break
+    else:
+        raise RuntimeError("Could not parse new MEGA link from mega-export output:\n" + result.stdout)
 
-    raise RuntimeError("Could not parse new MEGA link from mega-export output:\n" + result.stdout)
+    # Return both paths so main.py can decide which one to delete
+    return link, old_path, new_path
 
 
 if __name__ == "__main__":
