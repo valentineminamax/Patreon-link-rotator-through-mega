@@ -6,7 +6,6 @@ Includes automatic token refresh and proper URL encoding.
 import os
 import re
 import requests
-from urllib.parse import urlencode
 from config import PATREON_POST_URL
 
 PATREON_API_BASE = "https://www.patreon.com/api/oauth2/v2"
@@ -41,13 +40,10 @@ def _refresh_access_token() -> str:
 
 
 def _get_campaign_id() -> str:
-    """
-    Get the campaign ID from the Patreon API.
-    Uses URL-encoded field parameter to avoid 400 errors.
-    """
-    headers = {"Authorization": f"Bearer {PATREON_ACCESS_TOKEN}"}
+    """Get the campaign ID from the Patreon API."""
+    global PATREON_ACCESS_TOKEN  # Must be first in this function
 
-    # Properly URL-encode the fields parameter
+    headers = {"Authorization": f"Bearer {PATREON_ACCESS_TOKEN}"}
     params = {"fields[campaign]": "id,creation_name"}
 
     response = requests.get(
@@ -60,8 +56,6 @@ def _get_campaign_id() -> str:
     if response.status_code == 401:
         print("⚠️ Access token expired. Refreshing...", flush=True)
         new_token = _refresh_access_token()
-        # Update the global token for this run
-        global PATREON_ACCESS_TOKEN
         PATREON_ACCESS_TOKEN = new_token
         headers = {"Authorization": f"Bearer {PATREON_ACCESS_TOKEN}"}
         response = requests.get(
@@ -80,9 +74,9 @@ def _get_campaign_id() -> str:
 
 
 def _find_post_by_url(campaign_id: str, post_url: str) -> dict:
-    """
-    Find a post by its URL. Fetches all posts and matches the URL.
-    """
+    """Find a post by its URL. Fetches all posts and matches the URL."""
+    global PATREON_ACCESS_TOKEN  # Must be first
+
     headers = {"Authorization": f"Bearer {PATREON_ACCESS_TOKEN}"}
     posts = []
     cursor = None
@@ -105,7 +99,6 @@ def _find_post_by_url(campaign_id: str, post_url: str) -> dict:
         if response.status_code == 401:
             print("⚠️ Access token expired during pagination. Refreshing...", flush=True)
             new_token = _refresh_access_token()
-            global PATREON_ACCESS_TOKEN
             PATREON_ACCESS_TOKEN = new_token
             headers = {"Authorization": f"Bearer {PATREON_ACCESS_TOKEN}"}
             continue
@@ -136,9 +129,9 @@ def _find_post_by_url(campaign_id: str, post_url: str) -> dict:
 
 
 def update_patreon_link(new_link: str) -> None:
-    """
-    Update the Patreon post content with the new MEGA link.
-    """
+    """Update the Patreon post content with the new MEGA link."""
+    global PATREON_ACCESS_TOKEN  # Must be first
+
     if not PATREON_ACCESS_TOKEN:
         raise RuntimeError("PATREON_ACCESS_TOKEN not set. Please add it to GitHub Secrets.")
 
@@ -177,7 +170,7 @@ def update_patreon_link(new_link: str) -> None:
     headers = {
         "Authorization": f"Bearer {PATREON_ACCESS_TOKEN}",
         "Content-Type": "application/json",
-        "User-Agent": "MEGA-Link-Rotator/1.0",  # Helps avoid 400 errors[reference:1]
+        "User-Agent": "MEGA-Link-Rotator/1.0",
     }
 
     response = requests.patch(
@@ -190,7 +183,6 @@ def update_patreon_link(new_link: str) -> None:
     if response.status_code == 401:
         print("⚠️ Access token expired. Refreshing and retrying...", flush=True)
         new_token = _refresh_access_token()
-        global PATREON_ACCESS_TOKEN
         PATREON_ACCESS_TOKEN = new_token
         headers["Authorization"] = f"Bearer {PATREON_ACCESS_TOKEN}"
         response = requests.patch(
