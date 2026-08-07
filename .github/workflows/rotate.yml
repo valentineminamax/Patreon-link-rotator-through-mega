@@ -8,7 +8,7 @@ on:
 jobs:
   rotate:
     runs-on: ubuntu-latest
-    timeout-minutes: 15   # hard ceiling for the whole job — nothing here should take this long
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -25,32 +25,24 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Restore Patreon session
-        # NOTE: previously `echo '${{ secrets.PATREON_SESSION_JSON }}' > file`.
-        # That's unsafe: if the JSON contains a single-quote character
-        # anywhere (a cookie value, token, URL param, etc.), it breaks out
-        # of the single-quoted shell string and corrupts the file into
-        # invalid JSON. Passing the secret through an env var and writing
-        # it with printf avoids any shell interpretation of its contents.
-        env:
-          PATREON_SESSION_JSON: ${{ secrets.PATREON_SESSION_JSON }}
-        run: printf '%s' "$PATREON_SESSION_JSON" > patreon_session.json
+      - name: Install dependencies
+        run: pip install requests
 
       - name: Login to MEGA
-        timeout-minutes: 2   # this step has no timeout of its own in mega_rotate.py's control
+        timeout-minutes: 2
         run: mega-login "${{ secrets.MEGA_EMAIL }}" "${{ secrets.MEGA_PASSWORD }}"
 
       - name: Run rotation
-       timeout-minutes: 5
-       env:
-             PROXY_HOST: ${{ secrets.PROXY_HOST }}
-             PROXY_PORT: ${{ secrets.PROXY_PORT }}
-             PROXY_USERNAME: ${{ secrets.PROXY_USERNAME }}
-             PROXY_PASSWORD: ${{ secrets.PROXY_PASSWORD }}
-             PATREON_ACCESS_TOKEN: ${{ secrets.PATREON_ACCESS_TOKEN }}
-             PATREON_CLIENT_ID: ${{ secrets.PATREON_CLIENT_ID }}
-             PATREON_CLIENT_SECRET: ${{ secrets.PATREON_CLIENT_SECRET }}
-             run: python main.py
+        timeout-minutes: 5
+        env:
+          PROXY_HOST: ${{ secrets.PROXY_HOST }}
+          PROXY_PORT: ${{ secrets.PROXY_PORT }}
+          PROXY_USERNAME: ${{ secrets.PROXY_USERNAME }}
+          PROXY_PASSWORD: ${{ secrets.PROXY_PASSWORD }}
+          PATREON_ACCESS_TOKEN: ${{ secrets.PATREON_ACCESS_TOKEN }}
+          PATREON_CLIENT_ID: ${{ secrets.PATREON_CLIENT_ID }}
+          PATREON_CLIENT_SECRET: ${{ secrets.PATREON_CLIENT_SECRET }}
+        run: python main.py
 
       - name: Upload Patreon failure evidence
         if: failure()
