@@ -22,7 +22,7 @@
 # "patreon-1" folder already matches this prefix and is used as-is.
 MEGA_BASE_DIR = "/Patreon Content"
 FOLDER_PREFIX = "patreon-"
-
+FOLDER_FIXED_NAME = "Mina Valentine"
 # --- Patreon settings ---
 # The post you edit every rotation (the one containing the MEGA link).
 PATREON_POST_URL = "https://www.patreon.com/MinaValentine/posts/mega-link-test-165354775?utm_medium=clipboard_copy&utm_source=copyLink&utm_campaign=postshare_creator&utm_content=join_link"
