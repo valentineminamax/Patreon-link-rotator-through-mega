@@ -1,152 +1,173 @@
 """
-Drives Patreon's post editor with Cloudflare bypass using Patchright + proxy.
-Proxy is only used for the browser, not for system commands.
+Updates Patreon post using the official Patreon API instead of Playwright.
+Faster, more reliable, and bypasses Cloudflare entirely.
 """
 
 import os
-import asyncio
-from patchright.async_api import async_playwright
-from playwright_captcha import CaptchaType, ClickSolver, FrameworkType
-
+import json
+import re
+import requests
 from config import PATREON_POST_URL
 
-STORAGE_STATE_PATH = "patreon_session.json"
+# Patreon API endpoints
+PATREON_API_BASE = "https://www.patreon.com/api/oauth2/v2"
+
+# Get credentials from environment (GitHub Secrets)
+PATREON_ACCESS_TOKEN = os.getenv("PATREON_ACCESS_TOKEN")
+PATREON_CLIENT_ID = os.getenv("PATREON_CLIENT_ID")
+PATREON_CLIENT_SECRET = os.getenv("PATREON_CLIENT_SECRET")
+
+# The post ID is extracted from the URL
+# Example: https://www.patreon.com/SirenSins/posts/uncut-videos-156969230
+# The post ID is the number at the end: 156969230
+# But your URL uses a slug format, so we need to fetch it dynamically.
 
 
-def _get_proxy_config():
-    """Build proxy dict from environment variables."""
-    host = os.getenv("PROXY_HOST")
-    port = os.getenv("PROXY_PORT")
-    username = os.getenv("PROXY_USERNAME")
-    password = os.getenv("PROXY_PASSWORD")
-
-    if host and port:
-        proxy = {"server": f"http://{host}:{port}"}
-        if username and password:
-            proxy["username"] = username
-            proxy["password"] = password
-        print(f"✅ Using proxy: {proxy['server']} (data counted only for browser traffic)", flush=True)
-        return proxy
-    print("⚠️ No proxy configured – will use direct connection.", flush=True)
+def _extract_post_id_from_url(url: str) -> str:
+    """Extract numeric post ID from Patreon post URL."""
+    # Try to find a numeric ID at the end of the URL
+    match = re.search(r'(\d+)$', url)
+    if match:
+        return match.group(1)
+    # If it's a slug format, we'll fetch the post by slug later
     return None
 
 
-async def update_patreon_link(new_link: str) -> None:
-    if not os.path.exists(STORAGE_STATE_PATH):
-        raise FileNotFoundError(
-            f"{STORAGE_STATE_PATH} not found. Run login_once.py locally first, "
-            "then set the PATREON_SESSION_JSON secret in your repo."
+def _get_campaign_id() -> str:
+    """Get the campaign ID from the Patreon API."""
+    headers = {"Authorization": f"Bearer {PATREON_ACCESS_TOKEN}"}
+    response = requests.get(
+        f"{PATREON_API_BASE}/campaigns",
+        headers=headers,
+        params={"fields[campaign]": "id,name"}
+    )
+    response.raise_for_status()
+    data = response.json()
+    if not data.get("data"):
+        raise RuntimeError("No campaign found for this access token.")
+    return data["data"][0]["id"]
+
+
+def _find_post_by_url(campaign_id: str, post_url: str) -> dict:
+    """
+    Find a post by its URL. Since the URL is the canonical one,
+    we can fetch all posts and match the URL.
+    """
+    headers = {"Authorization": f"Bearer {PATREON_ACCESS_TOKEN}"}
+    posts = []
+    cursor = None
+
+    # Paginate through all posts
+    while True:
+        params = {
+            "fields[post]": "id,title,content,url,published_at",
+            "page[limit]": 25,
+        }
+        if cursor:
+            params["page[cursor]"] = cursor
+
+        response = requests.get(
+            f"{PATREON_API_BASE}/campaigns/{campaign_id}/posts",
+            headers=headers,
+            params=params,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        for post in data.get("data", []):
+            # Check if this post's URL matches the one we want
+            post_url_from_api = post.get("attributes", {}).get("url")
+            if post_url_from_api and post_url_from_api == post_url:
+                return post
+            posts.append(post)
+
+        # Check for next page
+        links = data.get("links", {})
+        if "next" in links:
+            cursor = links["next"].split("page%5Bcursor%5D=")[-1]
+        else:
+            break
+
+    # If not found by exact URL, try by title or content match
+    # Fallback: find the post that contains the MEGA link
+    for post in posts:
+        content = post.get("attributes", {}).get("content", "")
+        if "mega.nz" in content:
+            return post
+
+    raise RuntimeError(f"Could not find post with URL: {post_url}")
+
+
+def update_patreon_link(new_link: str) -> None:
+    """
+    Update the Patreon post content with the new MEGA link.
+    """
+    # Check if all required credentials are available
+    if not PATREON_ACCESS_TOKEN:
+        raise RuntimeError(
+            "PATREON_ACCESS_TOKEN not set. Please add it to GitHub Secrets."
         )
 
-    proxy_config = _get_proxy_config()
+    # Get campaign ID
+    print("📡 Fetching campaign ID...", flush=True)
+    campaign_id = _get_campaign_id()
+    print(f"   Campaign ID: {campaign_id}", flush=True)
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",
-                "--disable-setuid-sandbox",
-                "--window-size=1920,1080",
-                "--disable-features=IsolateOrigins,site-per-process",
-            ]
-        )
-        context = await browser.new_context(
-            storage_state=STORAGE_STATE_PATH,
-            viewport={"width": 1920, "height": 1080},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/151.0.0.0 Safari/537.36"
-            ),
-            proxy=proxy_config,
-            locale="en-US",
-            timezone_id="America/New_York",
-        )
-        page = await context.new_page()
+    # Find the post by its URL
+    print(f"📡 Finding post: {PATREON_POST_URL}", flush=True)
+    post = _find_post_by_url(campaign_id, PATREON_POST_URL)
+    post_id = post.get("id")
+    post_attributes = post.get("attributes", {})
+    current_content = post_attributes.get("content", "")
+    title = post_attributes.get("title", "Untitled")
 
-        # Set a default timeout for all actions (60 seconds)
-        page.set_default_timeout(60000)
+    print(f"   Found post: {title} (ID: {post_id})", flush=True)
 
-        try:
-            await _run_update_flow(page, new_link)
-        except Exception:
-            try:
-                await page.screenshot(path="patreon_failure.png", full_page=True)
-            except Exception:
-                pass
-            try:
-                with open("patreon_failure.html", "w", encoding="utf-8") as f:
-                    f.write(await page.content())
-            except Exception:
-                pass
-            raise
-        finally:
-            await browser.close()
+    # Replace the old MEGA link with the new one in the content
+    # Look for any MEGA link pattern and replace it
+    old_link_pattern = r'(https?://mega\.nz/folder/[^#]+#[^\s"\'<>]+)'
+    new_content = re.sub(old_link_pattern, new_link, current_content)
 
+    if new_content == current_content:
+        # If no MEGA link found, just append it (or warn)
+        print("   ⚠️ No existing MEGA link found in content. Appending...", flush=True)
+        new_content = current_content + f"\n\nMEGA Link: {new_link}"
 
-async def _run_update_flow(page, new_link: str) -> None:
-    # Navigate to the post with a longer timeout (90 seconds)
-    await page.goto(PATREON_POST_URL, wait_until="domcontentloaded", timeout=90000)
-    await asyncio.sleep(3)
+    # Prepare the update payload
+    update_data = {
+        "data": {
+            "type": "post",
+            "id": post_id,
+            "attributes": {
+                "content": new_content,
+            },
+        }
+    }
 
-    title = await page.title()
-    print(f"Page title: {title}", flush=True)
+    # Send the update request
+    print("📡 Updating post content...", flush=True)
+    headers = {
+        "Authorization": f"Bearer {PATREON_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    response = requests.patch(
+        f"{PATREON_API_BASE}/posts/{post_id}",
+        headers=headers,
+        json=update_data,
+    )
 
-    # Check for Cloudflare challenge – only if it appears
-    if "Just a moment..." in title or "Checking your browser" in title:
-        print("Cloudflare challenge detected. Attempting to bypass...", flush=True)
-
-        solver = ClickSolver(
-            framework=FrameworkType.PATCHRIGHT,
-            page=page,
-            max_attempts=5,
-            attempt_delay=5,
+    if response.status_code != 200:
+        error_detail = response.json() if response.text else "No details"
+        raise RuntimeError(
+            f"Failed to update post (HTTP {response.status_code}): {error_detail}"
         )
 
-        try:
-            async with solver:
-                try:
-                    await solver.solve_captcha(
-                        captcha_container=page,
-                        captcha_type=CaptchaType.CLOUDFLARE_TURNSTILE
-                    )
-                except Exception:
-                    print("Turnstile solver failed, trying Interstitial...", flush=True)
-                    await solver.solve_captcha(
-                        captcha_container=page,
-                        captcha_type=CaptchaType.CLOUDFLARE_INTERSTITIAL
-                    )
-            print("✅ Cloudflare challenge solved successfully.", flush=True)
-            await page.wait_for_load_state("networkidle", timeout=60000)
-            await asyncio.sleep(3)
-        except Exception as e:
-            with open("cloudflare_challenge.html", "w", encoding="utf-8") as f:
-                f.write(await page.content())
-            raise RuntimeError(f"Cloudflare bypass failed: {e}")
+    print("✅ Patreon post updated successfully!", flush=True)
+    print(f"   New link: {new_link}", flush=True)
 
-    # ---- Normal Patreon update flow ----
-    await page.get_by_role("button", name="Edit").click(timeout=60000)
-    await page.wait_for_timeout(1500)
 
-    await page.get_by_role("button", name="Menu for additional actions").click(timeout=60000)
-    await page.wait_for_timeout(500)
-
-    await page.get_by_role("menuitem", name="Delete").click(timeout=60000)
-    await page.wait_for_timeout(500)
-
-    await page.get_by_role("button", name="Delete").click(timeout=60000)
-    await page.wait_for_timeout(1000)
-
-    await page.locator("button").filter(has_text="Link").click(timeout=60000)
-    await page.wait_for_timeout(500)
-
-    link_input = page.get_by_role("textbox", name="Type or paste URL")
-    await link_input.click(timeout=60000)
-    await link_input.fill(new_link)
-
-    await page.wait_for_timeout(3000)
-
-    await page.get_by_role("button", name="Update").click(timeout=60000)
-    await page.wait_for_timeout(2000)
+# For testing locally
+if __name__ == "__main__":
+    # Test with a dummy link
+    test_link = "https://mega.nz/folder/test#test"
+    update_patreon_link(test_link)
