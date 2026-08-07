@@ -1,8 +1,15 @@
+import os
+import re
 import requests
 
+PATREON_API_BASE = "https://www.patreon.com/api/oauth2/v2"
+
+# Get credentials from environment
+PATREON_ACCESS_TOKEN = os.getenv("PATREON_ACCESS_TOKEN")
+PATREON_REFRESH_TOKEN = os.getenv("PATREON_REFRESH_TOKEN")
 PATREON_CLIENT_ID = os.getenv("PATREON_CLIENT_ID")
 PATREON_CLIENT_SECRET = os.getenv("PATREON_CLIENT_SECRET")
-PATREON_REFRESH_TOKEN = os.getenv("PATREON_REFRESH_TOKEN")  # Add this secret
+PATREON_POST_URL = os.getenv("PATREON_POST_URL")  # Or import from config
 
 
 def refresh_access_token() -> str:
@@ -23,7 +30,6 @@ def refresh_access_token() -> str:
     print("✅ Access token refreshed successfully!", flush=True)
     print(f"   New access token: {new_access_token[:20]}...", flush=True)
     
-    # Store the new refresh token for next time
     if new_refresh_token:
         print(f"   New refresh token: {new_refresh_token[:20]}...", flush=True)
         print("   ⚠️ Update your PATREON_REFRESH_TOKEN secret with this new value!", flush=True)
@@ -33,7 +39,8 @@ def refresh_access_token() -> str:
 
 def _get_campaign_id() -> str:
     """Get the campaign ID from the Patreon API."""
-    # Check if token is valid, refresh if needed
+    global PATREON_ACCESS_TOKEN  # Declare global at the start of the function
+    
     headers = {"Authorization": f"Bearer {PATREON_ACCESS_TOKEN}"}
     response = requests.get(
         f"{PATREON_API_BASE}/campaigns",
@@ -45,8 +52,6 @@ def _get_campaign_id() -> str:
     if response.status_code == 401:
         print("⚠️ Access token expired. Refreshing...", flush=True)
         new_token = refresh_access_token()
-        # Update the global token for this run
-        global PATREON_ACCESS_TOKEN
         PATREON_ACCESS_TOKEN = new_token
         # Retry the request with new token
         headers = {"Authorization": f"Bearer {PATREON_ACCESS_TOKEN}"}
@@ -61,3 +66,114 @@ def _get_campaign_id() -> str:
     if not data.get("data"):
         raise RuntimeError("No campaign found for this access token.")
     return data["data"][0]["id"]
+
+
+def _find_post_by_url(campaign_id: str, post_url: str) -> dict:
+    """Find a post by its URL."""
+    global PATREON_ACCESS_TOKEN
+    headers = {"Authorization": f"Bearer {PATREON_ACCESS_TOKEN}"}
+    posts = []
+    cursor = None
+
+    while True:
+        params = {
+            "fields[post]": "id,title,content,url,published_at",
+            "page[limit]": 25,
+        }
+        if cursor:
+            params["page[cursor]"] = cursor
+
+        response = requests.get(
+            f"{PATREON_API_BASE}/campaigns/{campaign_id}/posts",
+            headers=headers,
+            params=params,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        for post in data.get("data", []):
+            post_url_from_api = post.get("attributes", {}).get("url")
+            if post_url_from_api and post_url_from_api == post_url:
+                return post
+            posts.append(post)
+
+        links = data.get("links", {})
+        if "next" in links:
+            cursor = links["next"].split("page%5Bcursor%5D=")[-1]
+        else:
+            break
+
+    # Fallback: find post containing "mega.nz"
+    for post in posts:
+        content = post.get("attributes", {}).get("content", "")
+        if "mega.nz" in content:
+            return post
+
+    raise RuntimeError(f"Could not find post with URL: {post_url}")
+
+
+def update_patreon_link(new_link: str) -> None:
+    """Update the Patreon post content with the new MEGA link."""
+    global PATREON_ACCESS_TOKEN, PATREON_REFRESH_TOKEN  # not needed but okay
+    
+    if not PATREON_ACCESS_TOKEN:
+        raise RuntimeError("PATREON_ACCESS_TOKEN not set.")
+    
+    if not PATREON_REFRESH_TOKEN:
+        print("⚠️ PATREON_REFRESH_TOKEN not set. Token may expire soon.", flush=True)
+
+    print("📡 Fetching campaign ID...", flush=True)
+    campaign_id = _get_campaign_id()
+    print(f"   Campaign ID: {campaign_id}", flush=True)
+
+    print(f"📡 Finding post...", flush=True)
+    # Since we might not have PATREON_POST_URL imported, we can get it from config
+    from config import PATREON_POST_URL
+    post = _find_post_by_url(campaign_id, PATREON_POST_URL)
+    post_id = post.get("id")
+    post_attributes = post.get("attributes", {})
+    current_content = post_attributes.get("content", "")
+    title = post_attributes.get("title", "Untitled")
+    print(f"   Found post: {title} (ID: {post_id})", flush=True)
+
+    # Replace old MEGA link with new one
+    old_link_pattern = r'(https?://mega\.nz/folder/[^#]+#[^\s"\'<>]+)'
+    new_content = re.sub(old_link_pattern, new_link, current_content)
+
+    if new_content == current_content:
+        print("   ⚠️ No existing MEGA link found in content. Appending...", flush=True)
+        new_content = current_content + f"\n\nMEGA Link: {new_link}"
+
+    update_data = {
+        "data": {
+            "type": "post",
+            "id": post_id,
+            "attributes": {
+                "content": new_content,
+            },
+        }
+    }
+
+    print("📡 Updating post content...", flush=True)
+    headers = {
+        "Authorization": f"Bearer {PATREON_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    response = requests.patch(
+        f"{PATREON_API_BASE}/posts/{post_id}",
+        headers=headers,
+        json=update_data,
+    )
+
+    if response.status_code != 200:
+        error_detail = response.json() if response.text else "No details"
+        raise RuntimeError(f"Failed to update post (HTTP {response.status_code}): {error_detail}")
+
+    print("✅ Patreon post updated successfully!", flush=True)
+    print(f"   New link: {new_link}", flush=True)
+
+
+# For testing locally
+if __name__ == "__main__":
+    test_link = "https://mega.nz/folder/test#test"
+    update_patreon_link(test_link)
