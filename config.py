@@ -61,4 +61,4 @@ SELECTORS = {
 
 # --- Scheduling ---
 # Also update the cron expression in .github/workflows/rotate.yml to match.
-ROTATE_EVERY_HOURS = 40000
+ROTATE_EVERY_HOURS = 4
