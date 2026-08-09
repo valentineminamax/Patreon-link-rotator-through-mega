@@ -47,7 +47,6 @@ def _get_proxy_config() -> Optional[dict]:
         log.warning("No proxy credentials configured.")
         return None
     
-    # DataImpulse format: username__cr.ph,in; use sticky session
     import time
     session_id = str(int(time.time()))
     proxy_username = f"{username};sessid.{session_id}"
@@ -60,16 +59,15 @@ def _get_proxy_config() -> Optional[dict]:
     log.info(f"Using proxy: {proxy_config['server']} (sticky session)")
     return proxy_config
 
-# ========== PROXY TEST ==========
+# ========== PROXY TEST (using Firefox) ==========
 async def test_proxy():
-    """Test if the proxy works by fetching your public IP."""
     proxy_config = _get_proxy_config()
     if not proxy_config:
         log.warning("No proxy configured, skipping test.")
         return True
     
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.firefox.launch(headless=True)
         context = await browser.new_context(proxy=proxy_config)
         page = await context.new_page()
         try:
@@ -196,12 +194,10 @@ async def update_patreon_post(new_link: str) -> None:
     public_url = CONFIG["PUBLIC_URL"].format(post_id=CONFIG["POST_ID"])
     proxy_config = _get_proxy_config()
 
-    # ---- Test the proxy before opening Patreon ----
     if not await test_proxy():
         raise RuntimeError("Proxy test failed – check your credentials.")
 
     async with async_playwright() as p:
-        # ---- Use Firefox instead of Chromium (fixes proxy auth bug) ----
         browser = await p.firefox.launch(
             headless=CONFIG["HEADLESS"],
             args=[
@@ -274,7 +270,7 @@ async def update_patreon_post(new_link: str) -> None:
         finally:
             await browser.close()
 
-# ========== MEGA HELPERS WITH SAFE DELETION ==========
+# ========== MEGA HELPERS WITH NON‑BLOCKING DELETION ==========
 def _folder_exists(path: str) -> bool:
     try:
         result = subprocess.run(
@@ -316,13 +312,15 @@ def _delete_mega_folder_safe(path: str) -> bool:
         log.info(f"Successfully deleted {path}")
         return True
     else:
-        log.warning(f"Failed to delete {path} (returncode {result.returncode})")
+        log.warning(f"Failed to delete {path} (returncode {result.returncode}) – will be cleaned up later.")
         return False
 
 def _rollback_sync(temp_path: str) -> None:
+    # Non‑critical: if it fails, we log and continue (the folder will be removed later)
     _delete_mega_folder_safe(temp_path)
 
 def _cleanup_old_sync(old_path: str) -> None:
+    # Same here – not critical if it fails
     _delete_mega_folder_safe(old_path)
 
 # ========== MAIN ==========
@@ -351,7 +349,7 @@ async def main():
 
     log.info("Patreon update verified. Now cleaning up old folder.")
     await loop.run_in_executor(None, _cleanup_old_sync, old_path)
-    log.info("=== Done. Old export (%s) disabled and folder deleted (if it existed). ===", old_name)
+    log.info("=== Done. Old export (if any) disabled and folder deletion attempted. ===")
 
 if __name__ == "__main__":
     asyncio.run(main())
