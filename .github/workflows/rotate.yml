@@ -26,7 +26,8 @@ jobs:
       - name: Install Python deps
         run: |
           pip install -q -r requirements.txt
-          patchright install --with-deps chromium
+          # Install both chromium and firefox
+          patchright install --with-deps chromium firefox
 
       - name: Restore Patreon session
         env:
