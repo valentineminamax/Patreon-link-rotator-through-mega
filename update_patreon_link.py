@@ -4,13 +4,12 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 
 from patchright.async_api import async_playwright, Page
 from playwright_captcha import CaptchaType, ClickSolver, FrameworkType
 from mega_rotate import rotate_mega_link
 
-# =========================== CONFIG ===========================
 CONFIG = {
     "SESSION_PATH": "patreon_session.json",
     "POST_ID": os.environ.get("PATREON_POST_ID", "123456789"),
@@ -25,18 +24,20 @@ CONFIG = {
     "LOCATOR_LINK_BUTTON_SELECTOR": "button:has-text('Link')",
     "LOCATOR_LINK_INPUT": {"role": "textbox", "name": "Type or paste URL"},
     "LOCATOR_UPDATE_BUTTON": {"role": "button", "name": "Update"},
-    "LOCATOR_CONFIRMATION": {"role": "status", "name": re.compile(r"saved|updated", re.I)},
 
     "HEADLESS": True,
     "NAV_TIMEOUT_MS": 90000,
     "ACTION_TIMEOUT_MS": 60000,
 }
 
+# Timeouts for individual steps
+STEP_TIMEOUT = 30  # seconds per major action
+UPDATE_TIMEOUT = 300  # 5 minutes for the whole Patreon update
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("patreon_update")
 
 def _get_proxy_config() -> Optional[dict]:
-    """Build proxy dict from env vars."""
     host = os.getenv("PROXY_HOST")
     port = os.getenv("PROXY_PORT")
     username = os.getenv("PROXY_USERNAME")
@@ -46,13 +47,12 @@ def _get_proxy_config() -> Optional[dict]:
         if username and password:
             proxy["username"] = username
             proxy["password"] = password
-        log.info(f"Using proxy: {proxy['server']}")
+        log.info(f"Using proxy for browser: {proxy['server']}")
         return proxy
     log.warning("No proxy configured – using direct connection.")
     return None
 
 async def _handle_cloudflare(page: Page) -> None:
-    """Detect and solve Cloudflare Turnstile or Interstitial."""
     title = await page.title()
     if "Just a moment..." in title or "Checking your browser" in title:
         log.info("Cloudflare challenge detected. Attempting bypass...")
@@ -65,15 +65,21 @@ async def _handle_cloudflare(page: Page) -> None:
         try:
             async with solver:
                 try:
-                    await solver.solve_captcha(
-                        captcha_container=page,
-                        captcha_type=CaptchaType.CLOUDFLARE_TURNSTILE
+                    await asyncio.wait_for(
+                        solver.solve_captcha(
+                            captcha_container=page,
+                            captcha_type=CaptchaType.CLOUDFLARE_TURNSTILE
+                        ),
+                        timeout=60
                     )
-                except Exception:
-                    log.warning("Turnstile solver failed, trying Interstitial...")
-                    await solver.solve_captcha(
-                        captcha_container=page,
-                        captcha_type=CaptchaType.CLOUDFLARE_INTERSTITIAL
+                except asyncio.TimeoutError:
+                    log.warning("Turnstile solver timed out, trying Interstitial...")
+                    await asyncio.wait_for(
+                        solver.solve_captcha(
+                            captcha_container=page,
+                            captcha_type=CaptchaType.CLOUDFLARE_INTERSTITIAL
+                        ),
+                        timeout=60
                     )
             log.info("Cloudflare challenge solved.")
             await page.wait_for_load_state("networkidle", timeout=60000)
@@ -85,46 +91,71 @@ async def _handle_cloudflare(page: Page) -> None:
             raise RuntimeError(f"Cloudflare bypass failed: {e}")
 
 async def _replace_link_in_editor(page: Page, new_link: str) -> None:
-    """Execute the exact manual workflow (one Update click)."""
-    await page.get_by_role(
-        CONFIG["LOCATOR_KEBAB_BUTTON"]["role"],
-        name=CONFIG["LOCATOR_KEBAB_BUTTON"]["name"]
-    ).click()
-
-    await page.get_by_role(
-        CONFIG["LOCATOR_DELETE_ITEM"]["role"],
-        name=CONFIG["LOCATOR_DELETE_ITEM"]["name"]
-    ).click()
-
-    await page.get_by_role(
-        CONFIG["LOCATOR_CONFIRM_DELETE"]["role"],
-        name=CONFIG["LOCATOR_CONFIRM_DELETE"]["name"]
-    ).click()
-
-    await page.locator(CONFIG["LOCATOR_LINK_BUTTON_SELECTOR"]).click()
-
-    await page.get_by_role(
-        CONFIG["LOCATOR_LINK_INPUT"]["role"],
-        name=CONFIG["LOCATOR_LINK_INPUT"]["name"]
-    ).fill(new_link)
-
-    await page.get_by_role(
-        CONFIG["LOCATOR_UPDATE_BUTTON"]["role"],
-        name=CONFIG["LOCATOR_UPDATE_BUTTON"]["name"]
-    ).click()
-    await asyncio.sleep(2)
-
+    """Exactly your workflow with timeouts on each action."""
     try:
-        await page.get_by_role(
-            CONFIG["LOCATOR_CONFIRMATION"]["role"],
-            name=CONFIG["LOCATOR_CONFIRMATION"]["name"]
-        ).wait_for(state="visible", timeout=15000)
-        log.info("Post update confirmed.")
-    except Exception:
-        log.warning("Confirmation toast not found, but proceeding.")
+        log.info("Step 1: Click kebab menu on the link block.")
+        await asyncio.wait_for(
+            page.get_by_role(
+                CONFIG["LOCATOR_KEBAB_BUTTON"]["role"],
+                name=CONFIG["LOCATOR_KEBAB_BUTTON"]["name"]
+            ).click(),
+            timeout=STEP_TIMEOUT
+        )
+
+        log.info("Step 2: Click Delete in dropdown.")
+        await asyncio.wait_for(
+            page.get_by_role(
+                CONFIG["LOCATOR_DELETE_ITEM"]["role"],
+                name=CONFIG["LOCATOR_DELETE_ITEM"]["name"]
+            ).click(),
+            timeout=STEP_TIMEOUT
+        )
+
+        log.info("Step 3: Confirm delete in popup.")
+        await asyncio.wait_for(
+            page.get_by_role(
+                CONFIG["LOCATOR_CONFIRM_DELETE"]["role"],
+                name=CONFIG["LOCATOR_CONFIRM_DELETE"]["name"]
+            ).click(),
+            timeout=STEP_TIMEOUT
+        )
+        await asyncio.sleep(0.5)
+
+        log.info("Step 4: Click the 'Link' button in the toolbar.")
+        await asyncio.wait_for(
+            page.locator(CONFIG["LOCATOR_LINK_BUTTON_SELECTOR"]).click(),
+            timeout=STEP_TIMEOUT
+        )
+
+        log.info("Step 5: Fill the URL input with the new link.")
+        await asyncio.wait_for(
+            page.get_by_role(
+                CONFIG["LOCATOR_LINK_INPUT"]["role"],
+                name=CONFIG["LOCATOR_LINK_INPUT"]["name"]
+            ).fill(new_link),
+            timeout=STEP_TIMEOUT
+        )
+
+        log.info("Step 6: Wait 3 seconds for the link to be processed.")
+        await asyncio.sleep(3)
+
+        log.info("Step 7: Click the 'Update' button once to save the post.")
+        await asyncio.wait_for(
+            page.get_by_role(
+                CONFIG["LOCATOR_UPDATE_BUTTON"]["role"],
+                name=CONFIG["LOCATOR_UPDATE_BUTTON"]["name"]
+            ).click(),
+            timeout=STEP_TIMEOUT
+        )
+
+        # Wait for the page to settle after clicking Update
+        await page.wait_for_load_state("networkidle", timeout=30000)
+        log.info("Update clicked, post should be saved.")
+
+    except asyncio.TimeoutError:
+        raise TimeoutError(f"Action timed out after {STEP_TIMEOUT} seconds.")
 
 async def update_patreon_post(new_link: str) -> None:
-    """Main async flow to edit the Patreon post."""
     session_path = Path(CONFIG["SESSION_PATH"])
     if not session_path.exists():
         raise FileNotFoundError(f"Session file not found: {session_path}")
@@ -163,14 +194,25 @@ async def update_patreon_post(new_link: str) -> None:
 
         try:
             log.info("Opening editor: %s", edit_url)
-            await page.goto(edit_url, wait_until="domcontentloaded")
+            await asyncio.wait_for(
+                page.goto(edit_url, wait_until="domcontentloaded"),
+                timeout=60
+            )
             await asyncio.sleep(2)
 
             await _handle_cloudflare(page)
-            await _replace_link_in_editor(page, new_link)
+
+            # Wrap the entire edit flow with a timeout
+            await asyncio.wait_for(
+                _replace_link_in_editor(page, new_link),
+                timeout=UPDATE_TIMEOUT
+            )
 
             log.info("Verifying public post: %s", public_url)
-            await page.goto(public_url, wait_until="domcontentloaded")
+            await asyncio.wait_for(
+                page.goto(public_url, wait_until="domcontentloaded"),
+                timeout=60
+            )
             content = await page.content()
             if new_link not in content:
                 raise RuntimeError(
@@ -179,7 +221,14 @@ async def update_patreon_post(new_link: str) -> None:
                 )
             log.info("Verification passed.")
 
+        except asyncio.TimeoutError:
+            log.error("Patreon update flow timed out after %s seconds.", UPDATE_TIMEOUT)
+            await page.screenshot(path="patreon_timeout.png", full_page=True)
+            with open("patreon_timeout.html", "w", encoding="utf-8") as f:
+                f.write(await page.content())
+            raise TimeoutError(f"Patreon update exceeded {UPDATE_TIMEOUT}s limit.")
         except Exception:
+            # Capture debug artifacts for other errors
             try:
                 await page.screenshot(path="patreon_failure.png", full_page=True)
             except Exception:
@@ -201,7 +250,6 @@ def _rollback_sync(temp_path: str) -> None:
 def _cleanup_old_sync(old_path: str) -> None:
     import subprocess
     log.info("Cleaning up old folder: %s", old_path)
-    # Try to disable export (may fail if already disabled, ignore errors)
     subprocess.run(["mega-export", "-d", old_path], capture_output=True, text=True)
     subprocess.run(["mega-rm", "-r", old_path], capture_output=True, text=True)
 
@@ -211,16 +259,14 @@ async def main():
 
     try:
         result = await loop.run_in_executor(None, rotate_mega_link)
-        # Unpack flexibly: handle 3 or 4 values
         if len(result) == 4:
             new_link, old_path, old_name, temp_path = result
-            log.info(f"Old folder name: {old_name}")
         elif len(result) == 3:
             new_link, old_path, temp_path = result
             old_name = old_path.split('/')[-1] if '/' in old_path else old_path
             log.info(f"Old folder name (inferred): {old_name}")
         else:
-            raise ValueError(f"Unexpected number of return values: {len(result)}")
+            raise ValueError(f"Unexpected return values: {len(result)}")
     except Exception as e:
         log.error(f"Failed to rotate MEGA link: {e}")
         raise
