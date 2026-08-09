@@ -4,7 +4,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 from patchright.async_api import async_playwright, Page
 from playwright_captcha import CaptchaType, ClickSolver, FrameworkType
@@ -12,22 +12,20 @@ from mega_rotate import rotate_mega_link
 
 # =========================== CONFIG ===========================
 CONFIG = {
-    "SESSION_PATH": "patreon_session.json",          # <-- your session file
+    "SESSION_PATH": "patreon_session.json",
     "POST_ID": os.environ.get("PATREON_POST_ID", "123456789"),
     "EDIT_URL": "https://www.patreon.com/posts/{post_id}/edit",
     "PUBLIC_URL": "https://www.patreon.com/posts/{post_id}",
 
     "MEGA_LINK_PATTERN": r"https://mega\.nz/folder/[A-Za-z0-9#_-]+",
 
-    # ----- LOCATORS from your codegen (exact matches) -----
     "LOCATOR_KEBAB_BUTTON": {"role": "button", "name": "Menu for additional actions"},
     "LOCATOR_DELETE_ITEM": {"role": "menuitem", "name": "Delete"},
     "LOCATOR_CONFIRM_DELETE": {"role": "button", "name": "Delete"},
     "LOCATOR_LINK_BUTTON_SELECTOR": "button:has-text('Link')",
     "LOCATOR_LINK_INPUT": {"role": "textbox", "name": "Type or paste URL"},
-    "LOCATOR_UPDATE_BUTTON": {"role": "button", "name": "Update"},   # single click
+    "LOCATOR_UPDATE_BUTTON": {"role": "button", "name": "Update"},
     "LOCATOR_CONFIRMATION": {"role": "status", "name": re.compile(r"saved|updated", re.I)},
-    # =======================================================
 
     "HEADLESS": True,
     "NAV_TIMEOUT_MS": 90000,
@@ -88,41 +86,34 @@ async def _handle_cloudflare(page: Page) -> None:
 
 async def _replace_link_in_editor(page: Page, new_link: str) -> None:
     """Execute the exact manual workflow (one Update click)."""
-    # 1. Click kebab menu
     await page.get_by_role(
         CONFIG["LOCATOR_KEBAB_BUTTON"]["role"],
         name=CONFIG["LOCATOR_KEBAB_BUTTON"]["name"]
     ).click()
 
-    # 2. Delete
     await page.get_by_role(
         CONFIG["LOCATOR_DELETE_ITEM"]["role"],
         name=CONFIG["LOCATOR_DELETE_ITEM"]["name"]
     ).click()
 
-    # 3. Confirm delete
     await page.get_by_role(
         CONFIG["LOCATOR_CONFIRM_DELETE"]["role"],
         name=CONFIG["LOCATOR_CONFIRM_DELETE"]["name"]
     ).click()
 
-    # 4. Click "Link" button
     await page.locator(CONFIG["LOCATOR_LINK_BUTTON_SELECTOR"]).click()
 
-    # 5. Fill URL
     await page.get_by_role(
         CONFIG["LOCATOR_LINK_INPUT"]["role"],
         name=CONFIG["LOCATOR_LINK_INPUT"]["name"]
     ).fill(new_link)
 
-    # 6. Click "Update" – attaches the link AND saves the post (single click)
     await page.get_by_role(
         CONFIG["LOCATOR_UPDATE_BUTTON"]["role"],
         name=CONFIG["LOCATOR_UPDATE_BUTTON"]["name"]
     ).click()
-    await asyncio.sleep(2)   # wait for save to complete
+    await asyncio.sleep(2)
 
-    # 7. Wait for confirmation (optional)
     try:
         await page.get_by_role(
             CONFIG["LOCATOR_CONFIRMATION"]["role"],
@@ -210,15 +201,30 @@ def _rollback_sync(temp_path: str) -> None:
 def _cleanup_old_sync(old_path: str) -> None:
     import subprocess
     log.info("Cleaning up old folder: %s", old_path)
+    # Try to disable export (may fail if already disabled, ignore errors)
     subprocess.run(["mega-export", "-d", old_path], capture_output=True, text=True)
     subprocess.run(["mega-rm", "-r", old_path], capture_output=True, text=True)
 
 async def main():
     log.info("=== Starting MEGA + Patreon link rotation ===")
     loop = asyncio.get_running_loop()
-    new_link, old_path, old_name, temp_path = await loop.run_in_executor(
-        None, rotate_mega_link
-    )
+
+    try:
+        result = await loop.run_in_executor(None, rotate_mega_link)
+        # Unpack flexibly: handle 3 or 4 values
+        if len(result) == 4:
+            new_link, old_path, old_name, temp_path = result
+            log.info(f"Old folder name: {old_name}")
+        elif len(result) == 3:
+            new_link, old_path, temp_path = result
+            old_name = old_path.split('/')[-1] if '/' in old_path else old_path
+            log.info(f"Old folder name (inferred): {old_name}")
+        else:
+            raise ValueError(f"Unexpected number of return values: {len(result)}")
+    except Exception as e:
+        log.error(f"Failed to rotate MEGA link: {e}")
+        raise
+
     log.info("New MEGA link ready: %s", new_link)
 
     try:
