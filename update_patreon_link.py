@@ -33,6 +33,7 @@ CONFIG = {
 
 STEP_TIMEOUT = 30
 UPDATE_TIMEOUT = 300
+MEGA_CMD_TIMEOUT = 60
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("patreon_update")
@@ -91,13 +92,7 @@ async def _handle_cloudflare(page: Page) -> None:
             raise RuntimeError(f"Cloudflare bypass failed: {e}")
 
 async def _replace_link_in_editor(page: Page, new_link: str) -> None:
-    """
-    Workflow:
-    - Try to find the kebab menu (if present → old link exists → delete it).
-    - If not found, skip deletion.
-    - Then click Link button, paste new link, wait 3s, click Update.
-    """
-    # Check if the kebab menu exists (old link present)
+    # Check if old link block exists
     kebab_locator = page.get_by_role(
         CONFIG["LOCATOR_KEBAB_BUTTON"]["role"],
         name=CONFIG["LOCATOR_KEBAB_BUTTON"]["name"]
@@ -159,7 +154,6 @@ async def _replace_link_in_editor(page: Page, new_link: str) -> None:
         ).click(),
         timeout=STEP_TIMEOUT
     )
-    # Don't wait for network idle – just proceed
 
 async def update_patreon_post(new_link: str) -> None:
     session_path = Path(CONFIG["SESSION_PATH"])
@@ -213,7 +207,6 @@ async def update_patreon_post(new_link: str) -> None:
                 timeout=UPDATE_TIMEOUT
             )
 
-            # Verify
             log.info("Verifying public post: %s", public_url)
             await asyncio.wait_for(
                 page.goto(public_url, wait_until="domcontentloaded"),
@@ -247,24 +240,62 @@ async def update_patreon_post(new_link: str) -> None:
         finally:
             await browser.close()
 
-def _run_subprocess_with_timeout(cmd, timeout=120):
-    """Run subprocess with timeout and return result."""
+# ----- MEGA helper with existence check -----
+def _folder_exists(path: str) -> bool:
+    """Check if a MEGA folder exists using mega-ls."""
+    try:
+        result = subprocess.run(
+            ["mega-ls", path],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        return result.returncode == 0
+    except subprocess.TimeoutExpired:
+        log.warning(f"Timeout checking existence of {path} – assuming it doesn't exist.")
+        return False
+
+def _run_mega_cmd(cmd, timeout=MEGA_CMD_TIMEOUT):
+    """Run a MEGA command, log errors but don't raise on timeout."""
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if result.returncode != 0:
+            log.warning(f"Command failed: {' '.join(cmd)}")
+            log.warning(f"stdout: {result.stdout}")
+            log.warning(f"stderr: {result.stderr}")
         return result
     except subprocess.TimeoutExpired:
-        raise TimeoutError(f"Command timed out after {timeout}s: {' '.join(cmd)}")
+        log.warning(f"Command timed out after {timeout}s: {' '.join(cmd)}")
+        # Return a dummy result with non-zero returncode to indicate failure
+        class DummyResult:
+            returncode = -1
+            stdout = ""
+            stderr = "Timeout"
+        return DummyResult()
+
+def _delete_mega_folder_safe(path: str) -> bool:
+    """Delete a MEGA folder only if it exists. Returns True if deleted or already gone."""
+    if not _folder_exists(path):
+        log.info(f"Folder {path} does not exist – skipping deletion.")
+        return True
+
+    log.info(f"Deleting folder: {path}")
+    # First, disable export (if any)
+    _run_mega_cmd(["mega-export", "-d", path])
+    # Then delete
+    result = _run_mega_cmd(["mega-rm", "-r", path])
+    if result.returncode == 0:
+        log.info(f"Successfully deleted {path}")
+        return True
+    else:
+        log.warning(f"Failed to delete {path} (returncode {result.returncode})")
+        return False
 
 def _rollback_sync(temp_path: str) -> None:
-    log.info("Rolling back: removing temp folder %s", temp_path)
-    _run_subprocess_with_timeout(["mega-rm", "-r", temp_path], timeout=60)
+    _delete_mega_folder_safe(temp_path)
 
 def _cleanup_old_sync(old_path: str) -> None:
-    log.info("Disabling export on old folder: %s", old_path)
-    # Try to disable export (may already be disabled, but we do it anyway)
-    _run_subprocess_with_timeout(["mega-export", "-d", old_path], timeout=60)
-    log.info("Deleting old folder: %s", old_path)
-    _run_subprocess_with_timeout(["mega-rm", "-r", old_path], timeout=60)
+    _delete_mega_folder_safe(old_path)
 
 async def main():
     log.info("=== Starting MEGA + Patreon link rotation ===")
@@ -289,10 +320,9 @@ async def main():
         await loop.run_in_executor(None, _rollback_sync, temp_path)
         raise
 
-    # Only now we clean up the old folder (disable export + delete)
     log.info("Patreon update verified. Now cleaning up old folder.")
     await loop.run_in_executor(None, _cleanup_old_sync, old_path)
-    log.info("=== Done. Old export (%s) disabled and folder deleted. ===", old_name)
+    log.info("=== Done. Old export (%s) disabled and folder deleted (if it existed). ===", old_name)
 
 if __name__ == "__main__":
     asyncio.run(main())
