@@ -8,7 +8,9 @@ import time
 import re
 from config import MEGA_BASE_DIR, FOLDER_PREFIX, FOLDER_FIXED_NAME
 
-def _run(cmd, stdin_input=None, timeout=120):
+MEGA_TIMEOUT = 60  # reasonable timeout for copy/export
+
+def _run(cmd, stdin_input=None, timeout=MEGA_TIMEOUT):
     result = subprocess.run(cmd, capture_output=True, text=True, input=stdin_input, timeout=timeout)
     if result.returncode != 0:
         print(f"Command failed: {' '.join(cmd)}", flush=True)
@@ -44,15 +46,15 @@ def _find_active_folder() -> str:
         )
 
     if len(candidates) > 1:
-        # Clean up duplicates automatically: keep the newest (largest timestamp)
-        candidates.sort(key=lambda x: int(re.search(rf'{re.escape(FOLDER_PREFIX)}(\d+)', x).group(1)) if re.search(rf'{re.escape(FOLDER_PREFIX)}(\d+)', x) else 0, reverse=True)
-        newest = candidates[0]
-        for old in candidates[1:]:
-            old_path = f"{MEGA_BASE_DIR}/{old}"
-            print(f"⚠️ Found duplicate folder {old} – deleting it.")
-            _run(["mega-rm", "-r", old_path], timeout=60)
-        return newest
-
+        # Sort by timestamp (newest first) and pick the newest
+        def extract_ts(name):
+            match = re.search(rf'{re.escape(FOLDER_PREFIX)}(\d+)', name)
+            return int(match.group(1)) if match else 0
+        candidates.sort(key=extract_ts, reverse=True)
+        print(f"⚠️ Found {len(candidates)} folders matching '{FOLDER_PREFIX}*'. "
+              f"Using the newest: {candidates[0]}. "
+              f"The others will be cleaned up later after a successful update.", flush=True)
+        # Do NOT delete the older ones here – deletion will happen after Patreon succeeds.
     return candidates[0]
 
 def rotate_mega_link() -> tuple[str, str, str, str]:
