@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import sys
+import subprocess
 from pathlib import Path
 from typing import Optional
 
@@ -30,9 +31,8 @@ CONFIG = {
     "ACTION_TIMEOUT_MS": 60000,
 }
 
-# Timeouts for individual steps
-STEP_TIMEOUT = 30  # seconds per major action
-UPDATE_TIMEOUT = 300  # 5 minutes for the whole Patreon update
+STEP_TIMEOUT = 30
+UPDATE_TIMEOUT = 300
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("patreon_update")
@@ -91,16 +91,28 @@ async def _handle_cloudflare(page: Page) -> None:
             raise RuntimeError(f"Cloudflare bypass failed: {e}")
 
 async def _replace_link_in_editor(page: Page, new_link: str) -> None:
-    """Exactly your workflow with timeouts on each action."""
+    """
+    Workflow:
+    - Try to find the kebab menu (if present → old link exists → delete it).
+    - If not found, skip deletion.
+    - Then click Link button, paste new link, wait 3s, click Update.
+    """
+    # Check if the kebab menu exists (old link present)
+    kebab_locator = page.get_by_role(
+        CONFIG["LOCATOR_KEBAB_BUTTON"]["role"],
+        name=CONFIG["LOCATOR_KEBAB_BUTTON"]["name"]
+    )
+    kebab_visible = False
     try:
-        log.info("Step 1: Click kebab menu on the link block.")
-        await asyncio.wait_for(
-            page.get_by_role(
-                CONFIG["LOCATOR_KEBAB_BUTTON"]["role"],
-                name=CONFIG["LOCATOR_KEBAB_BUTTON"]["name"]
-            ).click(),
-            timeout=STEP_TIMEOUT
-        )
+        await asyncio.wait_for(kebab_locator.first.wait_for(state="visible", timeout=5), timeout=5)
+        kebab_visible = True
+        log.info("Old link block found – will delete it.")
+    except:
+        log.info("No old link block found – skipping deletion.")
+
+    if kebab_visible:
+        log.info("Step 1: Click kebab menu.")
+        await asyncio.wait_for(kebab_locator.click(), timeout=STEP_TIMEOUT)
 
         log.info("Step 2: Click Delete in dropdown.")
         await asyncio.wait_for(
@@ -111,7 +123,7 @@ async def _replace_link_in_editor(page: Page, new_link: str) -> None:
             timeout=STEP_TIMEOUT
         )
 
-        log.info("Step 3: Confirm delete in popup.")
+        log.info("Step 3: Confirm delete.")
         await asyncio.wait_for(
             page.get_by_role(
                 CONFIG["LOCATOR_CONFIRM_DELETE"]["role"],
@@ -121,39 +133,33 @@ async def _replace_link_in_editor(page: Page, new_link: str) -> None:
         )
         await asyncio.sleep(0.5)
 
-        log.info("Step 4: Click the 'Link' button in the toolbar.")
-        await asyncio.wait_for(
-            page.locator(CONFIG["LOCATOR_LINK_BUTTON_SELECTOR"]).click(),
-            timeout=STEP_TIMEOUT
-        )
+    log.info("Step 4: Click 'Link' button.")
+    await asyncio.wait_for(
+        page.locator(CONFIG["LOCATOR_LINK_BUTTON_SELECTOR"]).click(),
+        timeout=STEP_TIMEOUT
+    )
 
-        log.info("Step 5: Fill the URL input with the new link.")
-        await asyncio.wait_for(
-            page.get_by_role(
-                CONFIG["LOCATOR_LINK_INPUT"]["role"],
-                name=CONFIG["LOCATOR_LINK_INPUT"]["name"]
-            ).fill(new_link),
-            timeout=STEP_TIMEOUT
-        )
+    log.info("Step 5: Fill new URL.")
+    await asyncio.wait_for(
+        page.get_by_role(
+            CONFIG["LOCATOR_LINK_INPUT"]["role"],
+            name=CONFIG["LOCATOR_LINK_INPUT"]["name"]
+        ).fill(new_link),
+        timeout=STEP_TIMEOUT
+    )
 
-        log.info("Step 6: Wait 3 seconds for the link to be processed.")
-        await asyncio.sleep(3)
+    log.info("Step 6: Wait 3 seconds for link processing.")
+    await asyncio.sleep(3)
 
-        log.info("Step 7: Click the 'Update' button once to save the post.")
-        await asyncio.wait_for(
-            page.get_by_role(
-                CONFIG["LOCATOR_UPDATE_BUTTON"]["role"],
-                name=CONFIG["LOCATOR_UPDATE_BUTTON"]["name"]
-            ).click(),
-            timeout=STEP_TIMEOUT
-        )
-
-        # Wait for the page to settle after clicking Update
-        await page.wait_for_load_state("networkidle", timeout=30000)
-        log.info("Update clicked, post should be saved.")
-
-    except asyncio.TimeoutError:
-        raise TimeoutError(f"Action timed out after {STEP_TIMEOUT} seconds.")
+    log.info("Step 7: Click 'Update' once to save.")
+    await asyncio.wait_for(
+        page.get_by_role(
+            CONFIG["LOCATOR_UPDATE_BUTTON"]["role"],
+            name=CONFIG["LOCATOR_UPDATE_BUTTON"]["name"]
+        ).click(),
+        timeout=STEP_TIMEOUT
+    )
+    # Don't wait for network idle – just proceed
 
 async def update_patreon_post(new_link: str) -> None:
     session_path = Path(CONFIG["SESSION_PATH"])
@@ -202,12 +208,12 @@ async def update_patreon_post(new_link: str) -> None:
 
             await _handle_cloudflare(page)
 
-            # Wrap the entire edit flow with a timeout
             await asyncio.wait_for(
                 _replace_link_in_editor(page, new_link),
                 timeout=UPDATE_TIMEOUT
             )
 
+            # Verify
             log.info("Verifying public post: %s", public_url)
             await asyncio.wait_for(
                 page.goto(public_url, wait_until="domcontentloaded"),
@@ -222,13 +228,12 @@ async def update_patreon_post(new_link: str) -> None:
             log.info("Verification passed.")
 
         except asyncio.TimeoutError:
-            log.error("Patreon update flow timed out after %s seconds.", UPDATE_TIMEOUT)
+            log.error("Patreon update timed out after %s seconds.", UPDATE_TIMEOUT)
             await page.screenshot(path="patreon_timeout.png", full_page=True)
             with open("patreon_timeout.html", "w", encoding="utf-8") as f:
                 f.write(await page.content())
             raise TimeoutError(f"Patreon update exceeded {UPDATE_TIMEOUT}s limit.")
         except Exception:
-            # Capture debug artifacts for other errors
             try:
                 await page.screenshot(path="patreon_failure.png", full_page=True)
             except Exception:
@@ -242,16 +247,24 @@ async def update_patreon_post(new_link: str) -> None:
         finally:
             await browser.close()
 
+def _run_subprocess_with_timeout(cmd, timeout=120):
+    """Run subprocess with timeout and return result."""
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return result
+    except subprocess.TimeoutExpired:
+        raise TimeoutError(f"Command timed out after {timeout}s: {' '.join(cmd)}")
+
 def _rollback_sync(temp_path: str) -> None:
-    import subprocess
     log.info("Rolling back: removing temp folder %s", temp_path)
-    subprocess.run(["mega-rm", "-r", temp_path], capture_output=True, text=True)
+    _run_subprocess_with_timeout(["mega-rm", "-r", temp_path], timeout=60)
 
 def _cleanup_old_sync(old_path: str) -> None:
-    import subprocess
-    log.info("Cleaning up old folder: %s", old_path)
-    subprocess.run(["mega-export", "-d", old_path], capture_output=True, text=True)
-    subprocess.run(["mega-rm", "-r", old_path], capture_output=True, text=True)
+    log.info("Disabling export on old folder: %s", old_path)
+    # Try to disable export (may already be disabled, but we do it anyway)
+    _run_subprocess_with_timeout(["mega-export", "-d", old_path], timeout=60)
+    log.info("Deleting old folder: %s", old_path)
+    _run_subprocess_with_timeout(["mega-rm", "-r", old_path], timeout=60)
 
 async def main():
     log.info("=== Starting MEGA + Patreon link rotation ===")
@@ -261,10 +274,6 @@ async def main():
         result = await loop.run_in_executor(None, rotate_mega_link)
         if len(result) == 4:
             new_link, old_path, old_name, temp_path = result
-        elif len(result) == 3:
-            new_link, old_path, temp_path = result
-            old_name = old_path.split('/')[-1] if '/' in old_path else old_path
-            log.info(f"Old folder name (inferred): {old_name}")
         else:
             raise ValueError(f"Unexpected return values: {len(result)}")
     except Exception as e:
@@ -280,9 +289,10 @@ async def main():
         await loop.run_in_executor(None, _rollback_sync, temp_path)
         raise
 
-    log.info("Verified. Cleaning up old folder %s", old_path)
+    # Only now we clean up the old folder (disable export + delete)
+    log.info("Patreon update verified. Now cleaning up old folder.")
     await loop.run_in_executor(None, _cleanup_old_sync, old_path)
-    log.info("=== Done. Old export (%s) disabled. ===", old_name)
+    log.info("=== Done. Old export (%s) disabled and folder deleted. ===", old_name)
 
 if __name__ == "__main__":
     asyncio.run(main())
