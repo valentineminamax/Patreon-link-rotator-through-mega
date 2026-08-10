@@ -134,7 +134,40 @@ async def _replace_link_in_editor(page: Page, new_link: str) -> None:
         CONFIG["LOCATOR_UPDATE_BUTTON"]["role"],
         name=CONFIG["LOCATOR_UPDATE_BUTTON"]["name"]
     ).click()
-    await asyncio.sleep(2)
+
+    # FIX: a flat 2s sleep here was the actual root cause of the
+    # "link not inserted" failures - not a bad selector. Two things
+    # happen asynchronously after this click: (1) Patreon fetches embed
+    # metadata for the MEGA URL (the dashed placeholder box + spinner you
+    # see immediately after clicking), and (2) the post save request
+    # itself, which puts the Update button into a loading state
+    # (class containing "isLoading", data-tag="make-a-post-action-save" -
+    # confirmed from the captured failure HTML). 2s wasn't enough for
+    # either. Wait for both to actually finish instead of guessing a
+    # sleep duration.
+    log.info("Waiting for link embed to resolve...")
+    try:
+        await page.wait_for_function(
+            "(linkText) => document.body.innerHTML.includes(linkText)",
+            arg=new_link,
+            timeout=30000,
+        )
+    except Exception:
+        pass  # fall through to the explicit check below for a clear error + screenshot
+
+    log.info("Waiting for save (Update) request to complete...")
+    try:
+        await page.wait_for_function(
+            """() => {
+                const b = document.querySelector('button[data-tag="make-a-post-action-save"]');
+                return !b || !b.className.includes('isLoading');
+            }""",
+            timeout=30000,
+        )
+    except Exception:
+        pass
+
+    await asyncio.sleep(1)  # small settle buffer after both conditions clear
 
     # FIX: previously this function just trusted that Link->fill->Update
     # actually persisted the link, and the caller moved straight on to
