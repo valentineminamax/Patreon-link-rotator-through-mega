@@ -1,6 +1,6 @@
 """
-Rotates the MEGA public link – without disabling the old export.
-The old folder's export is left active until Patreon update succeeds.
+Rotates the MEGA public link – with rollback.
+The old folder's export is NOT disabled until Patreon update succeeds.
 """
 
 import subprocess
@@ -8,10 +8,8 @@ import time
 import re
 from config import MEGA_BASE_DIR, FOLDER_PREFIX, FOLDER_FIXED_NAME
 
-MEGA_TIMEOUT = 60  # reasonable timeout for copy/export
-
-def _run(cmd, stdin_input=None, timeout=MEGA_TIMEOUT):
-    result = subprocess.run(cmd, capture_output=True, text=True, input=stdin_input, timeout=timeout)
+def _run(cmd, stdin_input=None):
+    result = subprocess.run(cmd, capture_output=True, text=True, input=stdin_input, timeout=120)
     if result.returncode != 0:
         print(f"Command failed: {' '.join(cmd)}", flush=True)
         print(f"stdout: {result.stdout}", flush=True)
@@ -32,6 +30,12 @@ def _list_base_dir() -> list[str]:
     return [line.strip().rstrip("/") for line in result.stdout.splitlines() if line.strip()]
 
 def _find_active_folder() -> str:
+    """
+    Find the active folder:
+    1. First, check if a folder with the fixed name exists – use that.
+    2. If not, fall back to the prefix logic (for the first run).
+    3. Ensure exactly one folder is found.
+    """
     entries = _list_base_dir()
 
     if FOLDER_FIXED_NAME in entries:
@@ -46,23 +50,29 @@ def _find_active_folder() -> str:
         )
 
     if len(candidates) > 1:
-        # Sort by timestamp (newest first) and pick the newest
-        def extract_ts(name):
-            match = re.search(rf'{re.escape(FOLDER_PREFIX)}(\d+)', name)
-            return int(match.group(1)) if match else 0
-        candidates.sort(key=extract_ts, reverse=True)
-        print(f"⚠️ Found {len(candidates)} folders matching '{FOLDER_PREFIX}*'. "
-              f"Using the newest: {candidates[0]}. "
-              f"The others will be cleaned up later after a successful update.", flush=True)
-        # Do NOT delete the older ones here – deletion will happen after Patreon succeeds.
+        raise RuntimeError(
+            f"Found {len(candidates)} folders matching '{FOLDER_PREFIX}*' under "
+            f"{MEGA_BASE_DIR}: {candidates}. This means a previous run's cleanup "
+            "step failed and left an old folder behind -- manually check the MEGA app "
+            "and delete the stale one(s) yourself before re-running."
+        )
+
     return candidates[0]
 
-def rotate_mega_link() -> tuple[str, str, str, str]:
+def _extract_timestamp(name: str) -> int:
+    """Extract timestamp from folder name like 'patreon-1785868385'."""
+    match = re.search(rf'{re.escape(FOLDER_PREFIX)}(\d+)', name)
+    if match:
+        return int(match.group(1))
+    return 0
+
+def rotate_mega_link() -> tuple[str, str, str]:
     """
-    Returns: (new_link, old_path, old_name, temp_path)
+    Returns: (new_link, old_path, temp_path)
     - old_path: folder to delete if Patreon update succeeds
-    - old_name: name of old folder (for logging)
     - temp_path: folder to delete if Patreon update fails (rollback)
+    NOTE: The old folder's export is left active – we disable it only after
+    the Patreon update is verified.
     """
     active_name = _find_active_folder()
     old_path = f"{MEGA_BASE_DIR}/{active_name}"
@@ -85,10 +95,10 @@ def rotate_mega_link() -> tuple[str, str, str, str]:
     else:
         raise RuntimeError("Could not parse new MEGA link from mega-export output:\n" + result.stdout)
 
-    # DO NOT disable old export – we keep it alive until Patreon succeeds
+    # DO NOT disable old export yet – we keep it alive until Patreon succeeds
     print("Step 3/3: old export remains active (safe).", flush=True)
 
-    return link, old_path, active_name, temp_path
+    return link, old_path, temp_path
 
 if __name__ == "__main__":
     print(rotate_mega_link())
