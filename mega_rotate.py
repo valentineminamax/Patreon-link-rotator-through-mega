@@ -1,7 +1,7 @@
 """
-Rotates the MEGA public link – with rollback and auto‑cleanup of stale folders.
+Rotates the MEGA public link - with rollback and auto-cleanup of stale folders.
 The old folder's export is NOT disabled until Patreon update succeeds.
-If multiple folders exist, keep the newest and delete the rest.
+If multiple folders exist, keep the active one and delete the rest.
 """
 
 import subprocess
@@ -10,8 +10,10 @@ import re
 from config import MEGA_BASE_DIR, FOLDER_PREFIX, FOLDER_FIXED_NAME
 
 
-def _run(cmd, stdin_input=None):
-    result = subprocess.run(cmd, capture_output=True, text=True, input=stdin_input, timeout=120)
+def _run(cmd, stdin_input=None, timeout=120):
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, input=stdin_input, timeout=timeout
+    )
     if result.returncode != 0:
         print(f"Command failed: {' '.join(cmd)}", flush=True)
         print(f"stdout: {result.stdout}", flush=True)
@@ -40,65 +42,76 @@ def _extract_timestamp(name: str) -> int:
     return 0
 
 
+def _disable_export_quiet(path: str) -> None:
+    """Best-effort: disable a folder's export link. Never raises/hangs the run."""
+    try:
+        _run(["mega-export", "-d", path], stdin_input="yes\n", timeout=60)
+    except Exception as e:
+        print(f"Note: could not disable export on {path} (may already be disabled): {e}", flush=True)
+
+
 def _delete_folder(path: str) -> None:
     print(f"Deleting stale folder: {path}", flush=True)
-    _run(["mega-rm", "-r", path])
+    try:
+        _run(["mega-rm", "-r", path], timeout=90)
+    except Exception as e:
+        # A single stuck/failed stale-folder deletion shouldn't take down the whole rotation.
+        print(f"WARNING: failed to delete {path}: {e}", flush=True)
 
 
 def _find_active_folder() -> str:
     """
-    Find the active folder:
-    1. If FOLDER_FIXED_NAME exists, use it.
-    2. Else, get all folders starting with FOLDER_PREFIX.
-    3. If multiple, keep the newest (based on timestamp) and delete the rest.
-    4. Return the name of the kept folder.
+    Find the active folder and clean up any stale ones.
+
+    - If FOLDER_FIXED_NAME exists, it IS the active folder. Any leftover
+      FOLDER_PREFIX-timestamped folders are stale remnants of a previous
+      rotation (e.g. one that crashed before it could rename/delete) and
+      are cleaned up here. Previously this branch returned immediately and
+      never reached the cleanup logic at all, which is why stale folders
+      kept piling up.
+    - Otherwise, the newest FOLDER_PREFIX-timestamped folder is treated as
+      active, and every other timestamped folder is stale and deleted.
     """
     entries = _list_base_dir()
-
-    if FOLDER_FIXED_NAME and FOLDER_FIXED_NAME in entries:
-        return FOLDER_FIXED_NAME
-
     candidates = [e for e in entries if e.startswith(FOLDER_PREFIX)]
 
-    if len(candidates) == 0:
-        raise RuntimeError(
-            f"No folder starting with '{FOLDER_PREFIX}' found under {MEGA_BASE_DIR}. "
-            f"mega-ls returned: {entries}. Check FOLDER_PREFIX in config.py."
-        )
+    if FOLDER_FIXED_NAME and FOLDER_FIXED_NAME in entries:
+        active_name = FOLDER_FIXED_NAME
+        stale = candidates
+    else:
+        if len(candidates) == 0:
+            raise RuntimeError(
+                f"No folder starting with '{FOLDER_PREFIX}' found under {MEGA_BASE_DIR}, "
+                f"and FOLDER_FIXED_NAME ('{FOLDER_FIXED_NAME}') was not found either. "
+                f"mega-ls returned: {entries}. Check config.py."
+            )
+        candidates_with_ts = [(name, _extract_timestamp(name)) for name in candidates]
+        candidates_with_ts = [(n, ts) for n, ts in candidates_with_ts if ts > 0]
+        if not candidates_with_ts:
+            raise RuntimeError("No valid timestamp found in folder names.")
+        candidates_with_ts.sort(key=lambda x: x[1], reverse=True)
+        active_name = candidates_with_ts[0][0]
+        stale = [n for n, _ in candidates_with_ts[1:]]
 
-    if len(candidates) == 1:
-        return candidates[0]
-
-    # Multiple folders found: sort by timestamp descending, keep first (newest)
-    candidates_with_ts = [(name, _extract_timestamp(name)) for name in candidates]
-    # Remove any with timestamp 0 (shouldn't happen but just in case)
-    candidates_with_ts = [(n, ts) for n, ts in candidates_with_ts if ts > 0]
-    if not candidates_with_ts:
-        raise RuntimeError("No valid timestamp found in folder names.")
-    candidates_with_ts.sort(key=lambda x: x[1], reverse=True)
-    newest_name = candidates_with_ts[0][0]
-    stale = [n for n, _ in candidates_with_ts[1:]]
-
-    print(f"Found {len(candidates)} folders. Keeping newest: {newest_name}", flush=True)
+    if stale:
+        print(f"Found {len(stale)} stale folder(s) to clean up: {stale}", flush=True)
     for stale_name in stale:
         stale_path = f"{MEGA_BASE_DIR}/{stale_name}"
-        try:
-            # First try to disable export (in case it's still active)
-            _run(["mega-export", "-d", stale_path], stdin_input="yes\n")
-        except Exception:
-            pass  # ignore if already disabled
+        _disable_export_quiet(stale_path)
         _delete_folder(stale_path)
 
-    return newest_name
+    return active_name
 
 
 def rotate_mega_link() -> tuple[str, str, str]:
     """
     Returns: (new_link, old_path, temp_path)
-    - old_path: folder to delete if Patreon update succeeds
-    - temp_path: folder to delete if Patreon update fails (rollback)
-    NOTE: The old folder's export is left active – we disable it only after
-    the Patreon update is verified.
+    - old_path: the previously-active folder, to delete once the Patreon
+      update succeeds
+    - temp_path: timestamped folder holding the new export; delete it on
+      rollback, or pass it to finalize_active_folder() on success
+    NOTE: the old folder's export is left active - we disable it only
+    after the Patreon update is verified.
     """
     active_name = _find_active_folder()
     old_path = f"{MEGA_BASE_DIR}/{active_name}"
@@ -121,10 +134,29 @@ def rotate_mega_link() -> tuple[str, str, str]:
     else:
         raise RuntimeError("Could not parse new MEGA link from mega-export output:\n" + result.stdout)
 
-    # DO NOT disable old export yet – we keep it alive until Patreon succeeds
+    # DO NOT disable old export yet - we keep it alive until Patreon succeeds
     print("Step 3/3: old export remains active (safe).", flush=True)
 
     return link, old_path, temp_path
+
+
+def finalize_active_folder(temp_path: str) -> str:
+    """
+    Call this AFTER old_path has been deleted and the Patreon post has
+    been verified live with the new link.
+
+    If FOLDER_FIXED_NAME is configured, renames temp_path -> FOLDER_FIXED_NAME
+    so the *next* run's _find_active_folder() finds it by fixed name again
+    (this is the step that was previously missing entirely).
+    Returns the final path of the active folder.
+    """
+    if not FOLDER_FIXED_NAME:
+        return temp_path
+
+    final_path = f"{MEGA_BASE_DIR}/{FOLDER_FIXED_NAME}"
+    print(f"Renaming {temp_path} -> {final_path} ...", flush=True)
+    _run(["mega-mv", temp_path, final_path])
+    return final_path
 
 
 if __name__ == "__main__":
