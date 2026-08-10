@@ -8,7 +8,7 @@ from typing import Optional
 
 from patchright.async_api import async_playwright, Page
 from playwright_captcha import CaptchaType, ClickSolver, FrameworkType
-from mega_rotate import rotate_mega_link
+from mega_rotate import rotate_mega_link, finalize_active_folder
 
 # =========================== CONFIG ===========================
 CONFIG = {
@@ -89,15 +89,16 @@ async def _replace_link_in_editor(page: Page, new_link: str) -> None:
     Replaces the existing MEGA link with the new one.
     If no existing link is found, skip deletion and just add a new link.
     """
-    # First, check if the post body contains a MEGA link
-    # We'll get the content of the editor (or the page) to see if the pattern exists.
-    # Use page.content() or inner_text of the editor body.
-    # Simpler: try to locate any element containing the pattern.
-    # We'll use page.locator with text matching regex.
     try:
-        # Try to find any element containing the link pattern.
-        link_element = page.locator(f"text=/{CONFIG['MEGA_LINK_PATTERN']}/").first
-        # Wait a bit to see if it exists, but don't wait long.
+        # FIX: previously this built the selector as f"text=/{pattern}/",
+        # but MEGA_LINK_PATTERN itself contains literal "/" characters
+        # (https://mega.nz/folder/...), which breaks Playwright's
+        # "text=/regex/" delimiter parsing. That made this lookup fail
+        # silently every time (caught below), so has_link was always
+        # False and the old link was never actually deleted before
+        # adding the new one. Passing a compiled regex to get_by_text()
+        # avoids the string-delimiter problem entirely.
+        link_element = page.get_by_text(re.compile(CONFIG["MEGA_LINK_PATTERN"])).first
         await link_element.wait_for(state="attached", timeout=2000)
         has_link = True
     except Exception:
@@ -105,19 +106,16 @@ async def _replace_link_in_editor(page: Page, new_link: str) -> None:
 
     if has_link:
         log.info("Existing MEGA link found. Deleting it...")
-        # Click kebab menu
         await page.get_by_role(
             CONFIG["LOCATOR_KEBAB_BUTTON"]["role"],
             name=CONFIG["LOCATOR_KEBAB_BUTTON"]["name"]
         ).click()
 
-        # Delete
         await page.get_by_role(
             CONFIG["LOCATOR_DELETE_ITEM"]["role"],
             name=CONFIG["LOCATOR_DELETE_ITEM"]["name"]
         ).click()
 
-        # Confirm delete
         await page.get_by_role(
             CONFIG["LOCATOR_CONFIRM_DELETE"]["role"],
             name=CONFIG["LOCATOR_CONFIRM_DELETE"]["name"]
@@ -126,19 +124,17 @@ async def _replace_link_in_editor(page: Page, new_link: str) -> None:
     else:
         log.info("No existing MEGA link found. Skipping deletion.")
 
-    # Now add the new link
     log.info("Adding new link...")
     await page.locator(CONFIG["LOCATOR_LINK_BUTTON_SELECTOR"]).click()
     await page.get_by_role(
         CONFIG["LOCATOR_LINK_INPUT"]["role"],
         name=CONFIG["LOCATOR_LINK_INPUT"]["name"]
     ).fill(new_link)
-    # Click Update once to attach and save
     await page.get_by_role(
         CONFIG["LOCATOR_UPDATE_BUTTON"]["role"],
         name=CONFIG["LOCATOR_UPDATE_BUTTON"]["name"]
     ).click()
-    await asyncio.sleep(2)  # wait for update to apply
+    await asyncio.sleep(2)
 
 
 async def update_patreon_post(new_link: str) -> None:
@@ -186,7 +182,6 @@ async def update_patreon_post(new_link: str) -> None:
             await _handle_cloudflare(page)
             await _replace_link_in_editor(page, new_link)
 
-            # Verification
             log.info("Verifying public post: %s", public_url)
             await page.goto(public_url, wait_until="domcontentloaded")
             content = await page.content()
@@ -215,14 +210,32 @@ async def update_patreon_post(new_link: str) -> None:
 def _disable_and_remove_old(old_path: str) -> None:
     import subprocess
     log.info("Disabling old export and removing folder: %s", old_path)
-    subprocess.run(["mega-export", "-d", old_path], capture_output=True, text=True)
-    subprocess.run(["mega-rm", "-r", old_path], capture_output=True, text=True)
+    # FIX: previously these calls had no `input=` and no `timeout=`.
+    # mega-export -d waits for a "yes" confirmation on stdin; with no
+    # input supplied and no timeout, this could hang indefinitely if the
+    # prompt appeared (which matches the "gets stuck" symptom). Both
+    # calls now supply the confirmation and a hard timeout so a failure
+    # here surfaces as an exception instead of hanging the job forever.
+    try:
+        subprocess.run(
+            ["mega-export", "-d", old_path],
+            input="yes\n", capture_output=True, text=True, timeout=60,
+        )
+    except Exception as e:
+        log.warning("Could not disable export on %s (may already be disabled): %s", old_path, e)
+    try:
+        subprocess.run(
+            ["mega-rm", "-r", old_path],
+            capture_output=True, text=True, timeout=90,
+        )
+    except Exception as e:
+        log.warning("Could not remove old folder %s: %s", old_path, e)
 
 
 def _rollback_sync(temp_path: str) -> None:
     import subprocess
     log.info("Rolling back: removing temp folder %s", temp_path)
-    subprocess.run(["mega-rm", "-r", temp_path], capture_output=True, text=True)
+    subprocess.run(["mega-rm", "-r", temp_path], capture_output=True, text=True, timeout=90)
 
 
 async def main():
@@ -244,7 +257,13 @@ async def main():
 
     log.info("Verified. Cleaning up old folder %s", old_path)
     await loop.run_in_executor(None, _disable_and_remove_old, old_path)
-    log.info("=== Done. Old folder removed, new link is live. ===")
+
+    # FIX: this step didn't exist before, which is why the fixed folder
+    # name never came back after a successful rotation. Renames the temp
+    # folder back to FOLDER_FIXED_NAME (if configured) so next run's
+    # folder lookup finds it by fixed name again.
+    final_path = await loop.run_in_executor(None, finalize_active_folder, temp_path)
+    log.info("=== Done. Old folder removed. Active folder is now: %s ===", final_path)
 
 
 if __name__ == "__main__":
