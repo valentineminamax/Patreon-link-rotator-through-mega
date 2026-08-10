@@ -210,19 +210,29 @@ async def update_patreon_post(new_link: str) -> None:
 def _disable_and_remove_old(old_path: str) -> None:
     import subprocess
     log.info("Disabling old export and removing folder: %s", old_path)
-    # FIX: previously these calls had no `input=` and no `timeout=`.
-    # mega-export -d waits for a "yes" confirmation on stdin; with no
-    # input supplied and no timeout, this could hang indefinitely if the
-    # prompt appeared (which matches the "gets stuck" symptom). Both
-    # calls now supply the confirmation and a hard timeout so a failure
-    # here surfaces as an exception instead of hanging the job forever.
     try:
         subprocess.run(
             ["mega-export", "-d", old_path],
-            input="yes\n", capture_output=True, text=True, timeout=60,
+            input="yes\n", capture_output=True, text=True, timeout=15,
         )
     except Exception as e:
         log.warning("Could not disable export on %s (may already be disabled): %s", old_path, e)
+
+    # FIX: mega-rm -r is a synchronous, permanent delete that blocks until
+    # the whole recursive removal finishes server-side - that's what was
+    # hanging for minutes. Moving to the Rubbish Bin (//bin/) is a single
+    # lightweight call, effectively instant - the same thing a manual
+    # "delete" in the web/app actually does. Falls back to mega-rm -r only
+    # if the move itself fails.
+    try:
+        subprocess.run(
+            ["mega-mv", old_path, "//bin/"],
+            capture_output=True, text=True, timeout=20,
+        )
+        log.info("Old folder moved to Rubbish Bin: %s", old_path)
+        return
+    except Exception as e:
+        log.warning("Move-to-bin failed for %s (%s), falling back to mega-rm -r", old_path, e)
     try:
         subprocess.run(
             ["mega-rm", "-r", old_path],
@@ -234,8 +244,16 @@ def _disable_and_remove_old(old_path: str) -> None:
 
 def _rollback_sync(temp_path: str) -> None:
     import subprocess
-    log.info("Rolling back: removing temp folder %s", temp_path)
-    subprocess.run(["mega-rm", "-r", temp_path], capture_output=True, text=True, timeout=90)
+    log.info("Rolling back: moving temp folder to bin: %s", temp_path)
+    try:
+        subprocess.run(["mega-mv", temp_path, "//bin/"], capture_output=True, text=True, timeout=20)
+        return
+    except Exception as e:
+        log.warning("Move-to-bin failed for %s (%s), falling back to mega-rm -r", temp_path, e)
+    try:
+        subprocess.run(["mega-rm", "-r", temp_path], capture_output=True, text=True, timeout=90)
+    except Exception as e:
+        log.warning("Could not remove temp folder %s: %s", temp_path, e)
 
 
 async def main():
