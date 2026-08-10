@@ -136,6 +136,28 @@ async def _replace_link_in_editor(page: Page, new_link: str) -> None:
     ).click()
     await asyncio.sleep(2)
 
+    # FIX: previously this function just trusted that Link->fill->Update
+    # actually persisted the link, and the caller moved straight on to
+    # checking the *public* post - which then sat waiting on the full
+    # 90s nav timeout for a link that was never inserted in the first
+    # place. Check the editor DOM right here, immediately, so a broken
+    # insert flow fails in ~2 seconds with a screenshot showing exactly
+    # what the editor looked like, instead of stalling on verification.
+    editor_content = await page.content()
+    if new_link not in editor_content:
+        await page.screenshot(path="patreon_link_not_inserted.png", full_page=True)
+        with open("patreon_link_not_inserted.html", "w", encoding="utf-8") as f:
+            f.write(editor_content)
+        raise RuntimeError(
+            "Link does not appear in the editor after clicking Update - the "
+            "insert flow isn't persisting it (possibly needs selected text "
+            "first, or 'Update' here isn't the button that actually saves "
+            "it, or there's a separate top-level Publish/Save step). See "
+            "patreon_link_not_inserted.png / patreon_link_not_inserted.html "
+            "for the exact editor state at the point it failed."
+        )
+    log.info("Link confirmed present in editor DOM.")
+
 
 async def update_patreon_post(new_link: str) -> None:
     session_path = Path(CONFIG["SESSION_PATH"])
@@ -184,6 +206,12 @@ async def update_patreon_post(new_link: str) -> None:
 
             log.info("Verifying public post: %s", public_url)
             await page.goto(public_url, wait_until="domcontentloaded")
+            # FIX: Cloudflare was only ever handled on the editor page. If a
+            # challenge shows up here too, the script previously had no way
+            # to solve it and would just sit until NAV_TIMEOUT_MS expired
+            # (up to 90s) - which is what looked like "stuck."
+            await _handle_cloudflare(page)
+            log.info("Public post page loaded (title: %s)", await page.title())
             content = await page.content()
             if new_link not in content:
                 raise RuntimeError(
