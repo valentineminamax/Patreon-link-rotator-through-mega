@@ -12,21 +12,19 @@ from mega_rotate import rotate_mega_link
 
 # =========================== CONFIG ===========================
 CONFIG = {
-    "SESSION_PATH": "patreon_session.json",          # <-- your session file
+    "SESSION_PATH": "patreon_session.json",
     "POST_ID": os.environ.get("PATREON_POST_ID", "123456789"),
     "EDIT_URL": "https://www.patreon.com/posts/{post_id}/edit",
     "PUBLIC_URL": "https://www.patreon.com/posts/{post_id}",
 
     "MEGA_LINK_PATTERN": r"https://mega\.nz/folder/[A-Za-z0-9#_-]+",
 
-    # ----- LOCATORS from your codegen (exact matches) -----
     "LOCATOR_KEBAB_BUTTON": {"role": "button", "name": "Menu for additional actions"},
     "LOCATOR_DELETE_ITEM": {"role": "menuitem", "name": "Delete"},
     "LOCATOR_CONFIRM_DELETE": {"role": "button", "name": "Delete"},
     "LOCATOR_LINK_BUTTON_SELECTOR": "button:has-text('Link')",
     "LOCATOR_LINK_INPUT": {"role": "textbox", "name": "Type or paste URL"},
-    "LOCATOR_UPDATE_BUTTON": {"role": "button", "name": "Update"},   # single click
-    # =======================================================
+    "LOCATOR_UPDATE_BUTTON": {"role": "button", "name": "Update"},
 
     "HEADLESS": True,
     "NAV_TIMEOUT_MS": 90000,
@@ -36,8 +34,8 @@ CONFIG = {
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("patreon_update")
 
+
 def _get_proxy_config() -> Optional[dict]:
-    """Build proxy dict from env vars."""
     host = os.getenv("PROXY_HOST")
     port = os.getenv("PROXY_PORT")
     username = os.getenv("PROXY_USERNAME")
@@ -52,8 +50,8 @@ def _get_proxy_config() -> Optional[dict]:
     log.warning("No proxy configured – using direct connection.")
     return None
 
+
 async def _handle_cloudflare(page: Page) -> None:
-    """Detect and solve Cloudflare Turnstile or Interstitial."""
     title = await page.title()
     if "Just a moment..." in title or "Checking your browser" in title:
         log.info("Cloudflare challenge detected. Attempting bypass...")
@@ -85,44 +83,65 @@ async def _handle_cloudflare(page: Page) -> None:
                 f.write(await page.content())
             raise RuntimeError(f"Cloudflare bypass failed: {e}")
 
+
 async def _replace_link_in_editor(page: Page, new_link: str) -> None:
-    """Execute the exact manual workflow (one Update click)."""
-    # 1. Click kebab menu
-    await page.get_by_role(
-        CONFIG["LOCATOR_KEBAB_BUTTON"]["role"],
-        name=CONFIG["LOCATOR_KEBAB_BUTTON"]["name"]
-    ).click()
+    """
+    Replaces the existing MEGA link with the new one.
+    If no existing link is found, skip deletion and just add a new link.
+    """
+    # First, check if the post body contains a MEGA link
+    # We'll get the content of the editor (or the page) to see if the pattern exists.
+    # Use page.content() or inner_text of the editor body.
+    # Simpler: try to locate any element containing the pattern.
+    # We'll use page.locator with text matching regex.
+    try:
+        # Try to find any element containing the link pattern.
+        link_element = page.locator(f"text=/{CONFIG['MEGA_LINK_PATTERN']}/").first
+        # Wait a bit to see if it exists, but don't wait long.
+        await link_element.wait_for(state="attached", timeout=2000)
+        has_link = True
+    except Exception:
+        has_link = False
 
-    # 2. Delete
-    await page.get_by_role(
-        CONFIG["LOCATOR_DELETE_ITEM"]["role"],
-        name=CONFIG["LOCATOR_DELETE_ITEM"]["name"]
-    ).click()
+    if has_link:
+        log.info("Existing MEGA link found. Deleting it...")
+        # Click kebab menu
+        await page.get_by_role(
+            CONFIG["LOCATOR_KEBAB_BUTTON"]["role"],
+            name=CONFIG["LOCATOR_KEBAB_BUTTON"]["name"]
+        ).click()
 
-    # 3. Confirm delete
-    await page.get_by_role(
-        CONFIG["LOCATOR_CONFIRM_DELETE"]["role"],
-        name=CONFIG["LOCATOR_CONFIRM_DELETE"]["name"]
-    ).click()
+        # Delete
+        await page.get_by_role(
+            CONFIG["LOCATOR_DELETE_ITEM"]["role"],
+            name=CONFIG["LOCATOR_DELETE_ITEM"]["name"]
+        ).click()
 
-    # 4. Click "Link" button
+        # Confirm delete
+        await page.get_by_role(
+            CONFIG["LOCATOR_CONFIRM_DELETE"]["role"],
+            name=CONFIG["LOCATOR_CONFIRM_DELETE"]["name"]
+        ).click()
+        log.info("Link deleted.")
+    else:
+        log.info("No existing MEGA link found. Skipping deletion.")
+
+    # Now add the new link
+    log.info("Adding new link...")
     await page.locator(CONFIG["LOCATOR_LINK_BUTTON_SELECTOR"]).click()
-
-    # 5. Fill URL
     await page.get_by_role(
         CONFIG["LOCATOR_LINK_INPUT"]["role"],
         name=CONFIG["LOCATOR_LINK_INPUT"]["name"]
     ).fill(new_link)
-
-    # 6. Click "Update" – attaches the link AND saves the post (single click)
+    # Click Update once to attach and save
     await page.get_by_role(
         CONFIG["LOCATOR_UPDATE_BUTTON"]["role"],
         name=CONFIG["LOCATOR_UPDATE_BUTTON"]["name"]
     ).click()
-    await asyncio.sleep(2)   # wait for the update to apply (no confirmation toast)
+    await asyncio.sleep(2)  # wait for update to apply
+
 
 async def update_patreon_post(new_link: str) -> None:
-    """Main async flow to edit the Patreon post."""
     session_path = Path(CONFIG["SESSION_PATH"])
     if not session_path.exists():
         raise FileNotFoundError(f"Session file not found: {session_path}")
@@ -167,7 +186,7 @@ async def update_patreon_post(new_link: str) -> None:
             await _handle_cloudflare(page)
             await _replace_link_in_editor(page, new_link)
 
-            # --- Verification: check the new link appears on the live post ---
+            # Verification
             log.info("Verifying public post: %s", public_url)
             await page.goto(public_url, wait_until="domcontentloaded")
             content = await page.content()
@@ -192,16 +211,19 @@ async def update_patreon_post(new_link: str) -> None:
         finally:
             await browser.close()
 
+
 def _disable_and_remove_old(old_path: str) -> None:
     import subprocess
     log.info("Disabling old export and removing folder: %s", old_path)
     subprocess.run(["mega-export", "-d", old_path], capture_output=True, text=True)
     subprocess.run(["mega-rm", "-r", old_path], capture_output=True, text=True)
 
+
 def _rollback_sync(temp_path: str) -> None:
     import subprocess
     log.info("Rolling back: removing temp folder %s", temp_path)
     subprocess.run(["mega-rm", "-r", temp_path], capture_output=True, text=True)
+
 
 async def main():
     log.info("=== Starting MEGA + Patreon link rotation ===")
@@ -220,10 +242,10 @@ async def main():
         await loop.run_in_executor(None, _rollback_sync, temp_path)
         raise
 
-    # After verification, disable the old export and remove the old folder
     log.info("Verified. Cleaning up old folder %s", old_path)
     await loop.run_in_executor(None, _disable_and_remove_old, old_path)
     log.info("=== Done. Old folder removed, new link is live. ===")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
