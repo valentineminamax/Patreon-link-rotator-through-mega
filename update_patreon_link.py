@@ -35,6 +35,23 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("patreon_update")
 
 
+class VerificationInconclusiveError(Exception):
+    """
+    Raised when the script could not confirm whether the edit succeeded or
+    not (e.g. the verification page never finished loading). This is
+    deliberately a different exception type from a confirmed content
+    mismatch, because the two require different responses: a confirmed
+    mismatch means the edit genuinely didn't take and it's safe to roll
+    back to the old link. An inconclusive result means we simply don't
+    know - the 2026-08-13 network trace showed the save PATCH succeeding
+    server-side almost immediately, so treating "couldn't load the
+    verification page" the same as "verified the edit failed" was
+    destroying good temp folders on pure navigation/proxy hiccups that had
+    nothing to do with whether the edit worked.
+    """
+    pass
+
+
 def _get_proxy_config() -> Optional[dict]:
     host = os.getenv("PROXY_HOST")
     port = os.getenv("PROXY_PORT")
@@ -82,6 +99,59 @@ async def _handle_cloudflare(page: Page) -> None:
             with open("cloudflare_failure.html", "w", encoding="utf-8") as f:
                 f.write(await page.content())
             raise RuntimeError(f"Cloudflare bypass failed: {e}")
+
+
+async def _goto_with_retries(
+    page: Page,
+    url: str,
+    attempts: int = 3,
+    per_attempt_timeout_ms: int = 25000,
+) -> None:
+    """
+    Navigate with several short attempts instead of one long one.
+
+    FIX (2026-08-13): the previous code did a single
+    `page.goto(url, wait_until="domcontentloaded")` with the full 90s
+    NAV_TIMEOUT_MS. On the run that prompted this fix, that call hung for
+    the entire 90s and raised a bare TimeoutError - no title/Cloudflare
+    check ever ran (that code only executes *after* goto returns), and no
+    debug artifacts were written for that path, because the failure never
+    reached any of that logic. A single long wait gives no chance to
+    recover from a transient stall (proxy hiccup, a Cloudflare interstitial
+    that keeps re-triggering before "domcontentloaded" fires, brief
+    rate-limiting right after an edit, etc.) - it just burns the whole
+    budget once and gives up.
+
+    This retries a few shorter navigations instead, using wait_until=
+    "commit" (returns as soon as the response starts arriving, rather than
+    waiting for the full DOM) so a stuck attempt can be abandoned and
+    retried quickly, then explicitly waits for "domcontentloaded" with its
+    own short timeout. If ALL attempts fail to even get a response, this
+    raises VerificationInconclusiveError - NOT a generic exception - so
+    the caller can tell "we don't know what happened" apart from "we
+    loaded the page and the link isn't there."
+    """
+    last_err: Optional[Exception] = None
+    for attempt in range(1, attempts + 1):
+        try:
+            await page.goto(url, wait_until="commit", timeout=per_attempt_timeout_ms)
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=per_attempt_timeout_ms)
+            except Exception as e:
+                # Got a response (commit succeeded) but DOM never settled -
+                # still worth trying a Cloudflare check before giving up,
+                # since the interstitial itself counts as "committed."
+                log.warning("Attempt %d/%d: domcontentloaded did not settle: %s", attempt, attempts, e)
+            await _handle_cloudflare(page)
+            return
+        except Exception as e:
+            last_err = e
+            log.warning("Attempt %d/%d: navigation to %s did not complete: %s", attempt, attempts, url, e)
+            await asyncio.sleep(2 * attempt)  # small backoff between attempts
+
+    raise VerificationInconclusiveError(
+        f"Could not load {url} after {attempts} attempts - last error: {last_err}"
+    )
 
 
 async def _replace_link_in_editor(page: Page, new_link: str) -> None:
@@ -164,18 +234,7 @@ async def _replace_link_in_editor(page: Page, new_link: str) -> None:
     log.info("Update clicked, settle wait complete.")
 
 
-class VerificationInconclusive(Exception):
-    """
-    Raised when we could not even load the public post page to check for
-    the link - as opposed to loading it successfully and finding the link
-    genuinely missing. This distinction matters: we now have solid
-    evidence (a real run's network trace) that the Patreon save itself
-    succeeds fast and reliably. A network/proxy blip on this GET request
-    is not evidence the update failed, and rolling back (trashing the temp
-    MEGA folder) in that case would discard a likely-good link based on
-    nothing but our own inability to check it.
-    """
-    pass
+async def update_patreon_post(new_link: str) -> None:
     session_path = Path(CONFIG["SESSION_PATH"])
     if not session_path.exists():
         raise FileNotFoundError(f"Session file not found: {session_path}")
@@ -221,43 +280,16 @@ class VerificationInconclusive(Exception):
             await _replace_link_in_editor(page, new_link)
 
             log.info("Verifying public post: %s", public_url)
-            # FIX: previously a single 90s goto() here that, if it timed
-            # out (real run: it did - a raw network stall, not a
-            # Cloudflare challenge, since domcontentloaded never fired at
-            # all), was treated identically to "loaded fine but link is
-            # genuinely missing" - both triggered a rollback. Retry the
-            # navigation itself a couple times first; a transient
-            # proxy/network blip right after heavy editor activity is a
-            # plausible one-off, not proof the update failed.
-            nav_attempts = 3
-            last_nav_error = None
-            for attempt in range(1, nav_attempts + 1):
-                try:
-                    await page.goto(public_url, wait_until="domcontentloaded")
-                    last_nav_error = None
-                    break
-                except Exception as e:
-                    last_nav_error = e
-                    log.warning(
-                        "Navigation to public post failed (attempt %d/%d): %s",
-                        attempt, nav_attempts, e,
-                    )
-                    if attempt < nav_attempts:
-                        await asyncio.sleep(5)
-
-            if last_nav_error is not None:
-                # Never even got the page loaded after retries - this is
-                # NOT the same as "link confirmed missing." Do not let the
-                # caller roll back the temp folder for this.
-                raise VerificationInconclusive(
-                    f"Could not load the public post page after {nav_attempts} "
-                    f"attempts (last error: {last_nav_error}). The Patreon "
-                    "update itself may well have succeeded - this is a "
-                    "verification failure, not a confirmed content mismatch. "
-                    "NOT rolling back the new MEGA folder."
-                )
-
-            await _handle_cloudflare(page)
+            # FIX: previously a single page.goto(..., wait_until=
+            # "domcontentloaded") using the full 90s NAV_TIMEOUT_MS. On the
+            # run that prompted this fix, that call hung for the entire 90s
+            # and threw a bare TimeoutError before the Cloudflare check (or
+            # any content check) ever ran. _goto_with_retries() replaces
+            # this with several shorter attempts and raises
+            # VerificationInconclusiveError specifically if none of them
+            # even produce a page - see below for why that distinction
+            # matters.
+            await _goto_with_retries(page, public_url)
             log.info("Public post page loaded (title: %s)", await page.title())
             content = await page.content()
             if new_link not in content:
@@ -343,24 +375,27 @@ async def main():
 
     try:
         await update_patreon_post(new_link)
-    except VerificationInconclusive as e:
-        # We could not confirm success, but we also have no evidence of
-        # failure - the Patreon save itself has proven reliable in
-        # practice. Do NOT touch either MEGA folder: leave old_path (still
-        # exported, still working for anyone with the old link) and
-        # temp_path (holding the link we likely just set) both alone.
-        # Fail the job loudly so this run gets attention, but the safe
-        # next step is a human checking the live post, not the script
-        # guessing and potentially discarding a good link.
-        log.error(
-            "Could not verify the update, but NOT rolling back - the "
-            "underlying save has been reliable in practice and this looks "
-            "like a network/verification issue, not a content problem. "
-            "MANUAL CHECK NEEDED: %s -- old folder (%s) and temp folder "
-            "(%s) were both left untouched.",
-            e, old_path, temp_path,
+    except VerificationInconclusiveError:
+        # FIX: this used to fall into the same bare `except Exception` as a
+        # confirmed content mismatch, which rolled back (deleted) the temp
+        # folder - i.e. threw away a link that, per the 2026-08-13 network
+        # trace, had almost certainly already saved successfully server-side.
+        # An inconclusive verification means we genuinely don't know whether
+        # the edit took, so the safe move is to do nothing destructive:
+        # leave the old export + old folder alone (still live, so the post
+        # is never link-less) and leave the new temp folder alone too (so
+        # nothing is lost if the edit did succeed). This just surfaces
+        # loudly and exits non-zero so it's visible in the Actions run,
+        # for manual confirmation - the live post should be checked by hand
+        # before the next scheduled run.
+        log.exception(
+            "Could not verify the public post (navigation never completed) - "
+            "NOT rolling back and NOT cleaning up. Old link is still live at "
+            "%s, new folder %s was left in place in case the edit actually "
+            "succeeded. Check the live post manually.",
+            old_path, temp_path,
         )
-        raise
+        sys.exit(2)
     except Exception:
         log.exception("Patreon update failed – rolling back (deleting temp folder)")
         await loop.run_in_executor(None, _rollback_sync, temp_path)
