@@ -28,8 +28,8 @@ CONFIG = {
     "LOCATOR_INSERT_BUTTON": {"role": "button", "name": "Insert"},
 
     "HEADLESS": True,
-    "NAV_TIMEOUT_MS": 90000,
-    "ACTION_TIMEOUT_MS": 60000,
+    "NAV_TIMEOUT_MS": 120000,
+    "ACTION_TIMEOUT_MS": 120000,
 }
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -37,6 +37,12 @@ log = logging.getLogger("patreon_update")
 
 
 def _get_proxy_config() -> Optional[dict]:
+    # Only use proxy if explicitly enabled via environment variable
+    use_proxy = os.getenv("USE_PROXY", "false").lower() in ("true", "1", "yes")
+    if not use_proxy:
+        log.info("Proxy disabled by USE_PROXY setting – using direct connection.")
+        return None
+
     host = os.getenv("PROXY_HOST")
     port = os.getenv("PROXY_PORT")
     username = os.getenv("PROXY_USERNAME")
@@ -48,7 +54,7 @@ def _get_proxy_config() -> Optional[dict]:
             proxy["password"] = password
         log.info(f"Using proxy: {proxy['server']}")
         return proxy
-    log.warning("No proxy configured – using direct connection.")
+    log.warning("Proxy enabled but missing host/port – falling back to direct connection.")
     return None
 
 
@@ -89,7 +95,7 @@ async def _replace_link_in_editor(page: Page, new_link: str) -> None:
     """
     Replaces the existing MEGA link with the new one.
     If no existing link is found, skip deletion and just add a new link.
-    After insertion, it saves the post and waits 5 seconds.
+    After insertion, it saves the post and waits for navigation to the public page.
     """
     # Locate existing link
     try:
@@ -119,29 +125,23 @@ async def _replace_link_in_editor(page: Page, new_link: str) -> None:
 
     # Insert new link
     log.info("Adding new link...")
-    # Click the link insertion button (toolbar)
     link_button = page.locator(CONFIG["LOCATOR_LINK_BUTTON_SELECTOR"])
     if await link_button.count() == 0:
-        # Fallback to old selector
         link_button = page.locator("button:has-text('Link')")
     await link_button.click()
 
-    # Fill the URL
     await page.get_by_role(
         CONFIG["LOCATOR_LINK_INPUT"]["role"],
         name=CONFIG["LOCATOR_LINK_INPUT"]["name"]
     ).fill(new_link)
 
-    # Click the "Update" button inside the modal (fetches embed)
     await page.get_by_role(
         CONFIG["LOCATOR_UPDATE_BUTTON"]["role"],
         name=CONFIG["LOCATOR_UPDATE_BUTTON"]["name"]
     ).click()
 
-    # Wait for the modal to either close or show an "Insert" button
     log.info("Waiting for link embed to load and modal to close...")
     try:
-        # Wait for the textbox to become detached (modal closed)
         await page.get_by_role(
             CONFIG["LOCATOR_LINK_INPUT"]["role"],
             name=CONFIG["LOCATOR_LINK_INPUT"]["name"]
@@ -156,29 +156,25 @@ async def _replace_link_in_editor(page: Page, new_link: str) -> None:
         else:
             log.warning("No 'Insert' button found. Assuming link was inserted anyway.")
 
-    # ---- Improved link presence check ----
+    # Verify link presence
     log.info("Verifying link presence in editor (using text selector)...")
     try:
-        # Try to locate the link by text (regex) and wait for it to be attached.
         link_locator = page.get_by_text(re.compile(CONFIG["MEGA_LINK_PATTERN"])).first
         await link_locator.wait_for(state="attached", timeout=30000)
         log.info("Link found via text selector.")
     except Exception:
-        # Fallback: check for an <a> tag whose href contains the link pattern
         log.warning("Link not found via text selector, checking for anchor element...")
         try:
-            href_locator = page.locator(f'a[href*="{new_link[:50]}"]')  # partial match
+            href_locator = page.locator(f'a[href*="{new_link[:50]}"]')
             await href_locator.first.wait_for(state="attached", timeout=10000)
             log.info("Link found via href selector.")
         except Exception:
-            # Ultimate fallback: check if the full URL appears in the page HTML
             log.warning("Link not found via href selector, checking page content...")
-            await asyncio.sleep(2)  # give it a final moment
+            await asyncio.sleep(2)
             content = await page.content()
             if new_link in content:
                 log.info("Link found in page content after all.")
             else:
-                # Capture failure artifacts
                 await page.screenshot(path="patreon_link_not_inserted.png", full_page=True)
                 with open("patreon_link_not_inserted.html", "w", encoding="utf-8") as f:
                     f.write(content)
@@ -188,27 +184,29 @@ async def _replace_link_in_editor(page: Page, new_link: str) -> None:
                     "for the exact editor state."
                 )
 
-    # Now save the post (click the main "Save" or "Update" button)
+    # Save the post and wait for navigation to the public page
     log.info("Saving the post...")
     save_button = page.locator('button[data-tag="make-a-post-action-save"]')
-    await save_button.click()
+    # Click save and wait for URL to change (remove /edit)
+    async with page.context.expect_page() as new_page_info:
+        await save_button.click()
+        try:
+            # Wait for the URL to no longer contain "/edit"
+            await page.wait_for_url(lambda url: "/edit" not in url, timeout=60000)
+            log.info("Page navigated to public view.")
+        except Exception:
+            # If no navigation, check if a new tab opened
+            new_page = await new_page_info.value
+            if new_page:
+                log.info("Post opened in new tab.")
+                await new_page.wait_for_load_state("networkidle", timeout=60000)
+                await page.close()
+                page = new_page
+            else:
+                log.warning("No navigation detected. Falling back to manual navigation.")
+                # Manual navigation will be done in the caller
 
-    # Wait for save to complete (button no longer loading)
-    try:
-        await page.wait_for_function(
-            """() => {
-                const b = document.querySelector('button[data-tag="make-a-post-action-save"]');
-                return !b || !b.className.includes('isLoading');
-            }""",
-            timeout=30000,
-        )
-        log.info("Post saved successfully.")
-    except Exception as e:
-        log.warning("Save completion wait timed out: %s", e)
-
-    # Additional 5‑second wait to ensure backend propagation
-    log.info("Waiting 5 seconds for changes to propagate...")
-    await asyncio.sleep(5)
+    await asyncio.sleep(2)
 
 
 async def update_patreon_post(new_link: str) -> None:
@@ -256,8 +254,22 @@ async def update_patreon_post(new_link: str) -> None:
             await _handle_cloudflare(page)
             await _replace_link_in_editor(page, new_link)
 
-            log.info("Verifying public post: %s", public_url)
-            await page.goto(public_url, wait_until="domcontentloaded")
+            # If we're still on the edit page, manually navigate to public with retries
+            current_url = page.url
+            if "/edit" in current_url:
+                log.info("Still on edit page, manually navigating to public...")
+                for attempt in range(3):
+                    try:
+                        await page.goto(public_url, wait_until="domcontentloaded", timeout=90000)
+                        break
+                    except Exception as e:
+                        log.warning(f"Navigation attempt {attempt+1} failed: {e}. Retrying...")
+                        await asyncio.sleep(5)
+                else:
+                    raise RuntimeError("Failed to navigate to public post after 3 attempts.")
+            else:
+                log.info("Already on public page.")
+
             await _handle_cloudflare(page)
             log.info("Public post page loaded (title: %s)", await page.title())
             content = await page.content()
