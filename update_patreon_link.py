@@ -135,16 +135,31 @@ async def _replace_link_in_editor(page: Page, new_link: str) -> None:
         name=CONFIG["LOCATOR_UPDATE_BUTTON"]["name"]
     ).click()
 
-    # FIX: a flat 2s sleep here was the actual root cause of the
-    # "link not inserted" failures - not a bad selector. Two things
-    # happen asynchronously after this click: (1) Patreon fetches embed
-    # metadata for the MEGA URL (the dashed placeholder box + spinner you
-    # see immediately after clicking), and (2) the post save request
-    # itself, which puts the Update button into a loading state
-    # (class containing "isLoading", data-tag="make-a-post-action-save" -
-    # confirmed from the captured failure HTML). 2s wasn't enough for
-    # either. Wait for both to actually finish instead of guessing a
-    # sleep duration.
+    # DIAGNOSTIC: the previous version's two wait_for_function calls were
+    # wrapped in bare `except Exception: pass`, which hid what actually
+    # happened. The last real run showed the FIRST wait returning in 19ms
+    # (suspiciously fast - likely an immediate JS error, not a real result)
+    # and the SECOND wait genuinely burning the full 30s with the Update
+    # button still shown spinning afterward - i.e. Patreon's save request
+    # may be truly hanging, not just slow. Logging network activity here so
+    # the next failure shows exactly which request (if any) never resolves.
+    network_log = []
+
+    def _on_request(req):
+        if req.method == "POST" or "post" in req.url.lower() or "api" in req.url.lower():
+            network_log.append(f"-> {req.method} {req.url}")
+
+    def _on_response(res):
+        if res.request.method == "POST" or "post" in res.url.lower() or "api" in res.url.lower():
+            network_log.append(f"<- {res.status} {res.url}")
+
+    def _on_request_failed(req):
+        network_log.append(f"XX FAILED {req.method} {req.url} ({req.failure})")
+
+    page.on("request", _on_request)
+    page.on("response", _on_response)
+    page.on("requestfailed", _on_request_failed)
+
     log.info("Waiting for link embed to resolve...")
     try:
         await page.wait_for_function(
@@ -152,8 +167,8 @@ async def _replace_link_in_editor(page: Page, new_link: str) -> None:
             arg=new_link,
             timeout=30000,
         )
-    except Exception:
-        pass  # fall through to the explicit check below for a clear error + screenshot
+    except Exception as e:
+        log.warning("wait_for_function (embed resolve) did not confirm: %s", e)
 
     log.info("Waiting for save (Update) request to complete...")
     try:
@@ -164,8 +179,21 @@ async def _replace_link_in_editor(page: Page, new_link: str) -> None:
             }""",
             timeout=30000,
         )
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning("wait_for_function (save complete) did not confirm: %s", e)
+
+    page.remove_listener("request", _on_request)
+    page.remove_listener("response", _on_response)
+    page.remove_listener("requestfailed", _on_request_failed)
+
+    if network_log:
+        log.info("Network activity during Update wait:\n%s", "\n".join(network_log))
+    else:
+        log.warning(
+            "No POST/API network activity observed during the Update wait at all - "
+            "the save click may not be firing a request, or the proxy may be "
+            "swallowing it before it's visible to Playwright."
+        )
 
     await asyncio.sleep(1)  # small settle buffer after both conditions clear
 
