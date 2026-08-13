@@ -130,94 +130,38 @@ async def _replace_link_in_editor(page: Page, new_link: str) -> None:
         CONFIG["LOCATOR_LINK_INPUT"]["role"],
         name=CONFIG["LOCATOR_LINK_INPUT"]["name"]
     ).fill(new_link)
+
+    # Quick, non-fatal look that the link actually landed in the input/
+    # editor before confirming. This is just a sanity glance - it never
+    # raises. We deliberately don't hard-fail here anymore: a network
+    # trace from a real run showed the save PATCH returning 200 well
+    # within the old 30s waits, while Patreon's own client-side signals
+    # (Update button spinner, link text appearing in page.content()) still
+    # looked like a failure. The user has seen the exact same thing doing
+    # this manually - Patreon's editor UI shows an error/stuck state even
+    # when the update actually went through. So the editor is no longer
+    # treated as the source of truth; it's just a quick look.
+    try:
+        await page.wait_for_function(
+            "(linkText) => document.body.innerHTML.includes(linkText)",
+            arg=new_link,
+            timeout=3000,
+        )
+        log.info("Link visible in editor before confirming.")
+    except Exception:
+        log.info("Link not visibly rendered yet - proceeding to confirm anyway.")
+
     await page.get_by_role(
         CONFIG["LOCATOR_UPDATE_BUTTON"]["role"],
         name=CONFIG["LOCATOR_UPDATE_BUTTON"]["name"]
     ).click()
 
-    # DIAGNOSTIC: the previous version's two wait_for_function calls were
-    # wrapped in bare `except Exception: pass`, which hid what actually
-    # happened. The last real run showed the FIRST wait returning in 19ms
-    # (suspiciously fast - likely an immediate JS error, not a real result)
-    # and the SECOND wait genuinely burning the full 30s with the Update
-    # button still shown spinning afterward - i.e. Patreon's save request
-    # may be truly hanging, not just slow. Logging network activity here so
-    # the next failure shows exactly which request (if any) never resolves.
-    network_log = []
-
-    def _on_request(req):
-        if req.method == "POST" or "post" in req.url.lower() or "api" in req.url.lower():
-            network_log.append(f"-> {req.method} {req.url}")
-
-    def _on_response(res):
-        if res.request.method == "POST" or "post" in res.url.lower() or "api" in res.url.lower():
-            network_log.append(f"<- {res.status} {res.url}")
-
-    def _on_request_failed(req):
-        network_log.append(f"XX FAILED {req.method} {req.url} ({req.failure})")
-
-    page.on("request", _on_request)
-    page.on("response", _on_response)
-    page.on("requestfailed", _on_request_failed)
-
-    log.info("Waiting for link embed to resolve...")
-    try:
-        await page.wait_for_function(
-            "(linkText) => document.body.innerHTML.includes(linkText)",
-            arg=new_link,
-            timeout=30000,
-        )
-    except Exception as e:
-        log.warning("wait_for_function (embed resolve) did not confirm: %s", e)
-
-    log.info("Waiting for save (Update) request to complete...")
-    try:
-        await page.wait_for_function(
-            """() => {
-                const b = document.querySelector('button[data-tag="make-a-post-action-save"]');
-                return !b || !b.className.includes('isLoading');
-            }""",
-            timeout=30000,
-        )
-    except Exception as e:
-        log.warning("wait_for_function (save complete) did not confirm: %s", e)
-
-    page.remove_listener("request", _on_request)
-    page.remove_listener("response", _on_response)
-    page.remove_listener("requestfailed", _on_request_failed)
-
-    if network_log:
-        log.info("Network activity during Update wait:\n%s", "\n".join(network_log))
-    else:
-        log.warning(
-            "No POST/API network activity observed during the Update wait at all - "
-            "the save click may not be firing a request, or the proxy may be "
-            "swallowing it before it's visible to Playwright."
-        )
-
-    await asyncio.sleep(1)  # small settle buffer after both conditions clear
-
-    # FIX: previously this function just trusted that Link->fill->Update
-    # actually persisted the link, and the caller moved straight on to
-    # checking the *public* post - which then sat waiting on the full
-    # 90s nav timeout for a link that was never inserted in the first
-    # place. Check the editor DOM right here, immediately, so a broken
-    # insert flow fails in ~2 seconds with a screenshot showing exactly
-    # what the editor looked like, instead of stalling on verification.
-    editor_content = await page.content()
-    if new_link not in editor_content:
-        await page.screenshot(path="patreon_link_not_inserted.png", full_page=True)
-        with open("patreon_link_not_inserted.html", "w", encoding="utf-8") as f:
-            f.write(editor_content)
-        raise RuntimeError(
-            "Link does not appear in the editor after clicking Update - the "
-            "insert flow isn't persisting it (possibly needs selected text "
-            "first, or 'Update' here isn't the button that actually saves "
-            "it, or there's a separate top-level Publish/Save step). See "
-            "patreon_link_not_inserted.png / patreon_link_not_inserted.html "
-            "for the exact editor state at the point it failed."
-        )
-    log.info("Link confirmed present in editor DOM.")
+    # Fixed settle time and done - no post-Update verification here.
+    # The real check is the public-post verification in
+    # update_patreon_post(), which hits the actually-published page
+    # rather than trusting this editor's client-side state.
+    await asyncio.sleep(5)
+    log.info("Update clicked, settle wait complete.")
 
 
 async def update_patreon_post(new_link: str) -> None:
