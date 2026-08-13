@@ -34,24 +34,6 @@ CONFIG = {
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("patreon_update")
 
-
-class VerificationInconclusiveError(Exception):
-    """
-    Raised when the script could not confirm whether the edit succeeded or
-    not (e.g. the verification page never finished loading). This is
-    deliberately a different exception type from a confirmed content
-    mismatch, because the two require different responses: a confirmed
-    mismatch means the edit genuinely didn't take and it's safe to roll
-    back to the old link. An inconclusive result means we simply don't
-    know - the 2026-08-13 network trace showed the save PATCH succeeding
-    server-side almost immediately, so treating "couldn't load the
-    verification page" the same as "verified the edit failed" was
-    destroying good temp folders on pure navigation/proxy hiccups that had
-    nothing to do with whether the edit worked.
-    """
-    pass
-
-
 def _get_proxy_config() -> Optional[dict]:
     host = os.getenv("PROXY_HOST")
     port = os.getenv("PROXY_PORT")
@@ -66,7 +48,6 @@ def _get_proxy_config() -> Optional[dict]:
         return proxy
     log.warning("No proxy configured – using direct connection.")
     return None
-
 
 async def _handle_cloudflare(page: Page) -> None:
     title = await page.title()
@@ -99,112 +80,6 @@ async def _handle_cloudflare(page: Page) -> None:
             with open("cloudflare_failure.html", "w", encoding="utf-8") as f:
                 f.write(await page.content())
             raise RuntimeError(f"Cloudflare bypass failed: {e}")
-
-
-async def _goto_with_retries(
-    page: Page,
-    url: str,
-    attempts: int = 3,
-    per_attempt_timeout_ms: int = 25000,
-) -> None:
-    """
-    Navigate with several short attempts instead of one long one.
-
-    FIX (2026-08-13): the previous code did a single
-    `page.goto(url, wait_until="domcontentloaded")` with the full 90s
-    NAV_TIMEOUT_MS. On the run that prompted this fix, that call hung for
-    the entire 90s and raised a bare TimeoutError - no title/Cloudflare
-    check ever ran (that code only executes *after* goto returns), and no
-    debug artifacts were written for that path, because the failure never
-    reached any of that logic. A single long wait gives no chance to
-    recover from a transient stall (proxy hiccup, a Cloudflare interstitial
-    that keeps re-triggering before "domcontentloaded" fires, brief
-    rate-limiting right after an edit, etc.) - it just burns the whole
-    budget once and gives up.
-
-    This retries a few shorter navigations instead, using wait_until=
-    "commit" (returns as soon as the response starts arriving, rather than
-    waiting for the full DOM) so a stuck attempt can be abandoned and
-    retried quickly, then explicitly waits for "domcontentloaded" with its
-    own short timeout. If ALL attempts fail to even get a response, this
-    raises VerificationInconclusiveError - NOT a generic exception - so
-    the caller can tell "we don't know what happened" apart from "we
-    loaded the page and the link isn't there."
-    """
-    last_err: Optional[Exception] = None
-    for attempt in range(1, attempts + 1):
-        try:
-            await page.goto(url, wait_until="commit", timeout=per_attempt_timeout_ms)
-            try:
-                await page.wait_for_load_state("domcontentloaded", timeout=per_attempt_timeout_ms)
-            except Exception as e:
-                # Got a response (commit succeeded) but DOM never settled -
-                # still worth trying a Cloudflare check before giving up,
-                # since the interstitial itself counts as "committed."
-                log.warning("Attempt %d/%d: domcontentloaded did not settle: %s", attempt, attempts, e)
-            await _handle_cloudflare(page)
-            return
-        except Exception as e:
-            last_err = e
-            log.warning("Attempt %d/%d: navigation to %s did not complete: %s", attempt, attempts, url, e)
-            await asyncio.sleep(2 * attempt)  # small backoff between attempts
-
-    raise VerificationInconclusiveError(
-        f"Could not load {url} after {attempts} attempts - last error: {last_err}"
-    )
-
-
-async def _wait_for_editor_ready(
-    page: Page,
-    edit_url: str,
-    attempts: int = 2,
-    ready_timeout_ms: int = 30000,
-) -> None:
-    """
-    Wait for the post editor to actually finish hydrating before touching
-    it, instead of trusting a fixed sleep(2).
-
-    FIX (2026-08-13): the previous code did `goto(edit_url,
-    wait_until="domcontentloaded")` + `sleep(2)` + a Cloudflare title check,
-    then went straight for the "Link" toolbar button, relying on Playwright's
-    default 60s action-timeout as the only backstop. A captured failure
-    screenshot showed the page still full of grey shimmer/skeleton
-    placeholders 60+ seconds after that goto - the document had loaded
-    (title was plain "Patreon", no Cloudflare interstitial, ~387KB of real
-    payload) but Patreon's client-side app simply hadn't rendered the real
-    editor yet. The click didn't fail because the selector was wrong; there
-    was nothing there yet to click.
-
-    This waits explicitly for the Link toolbar button to become visible
-    (the actual signal we care about, not a guess at how long hydration
-    takes). If it's not visible within ready_timeout_ms, it reloads the
-    page once and tries again - a fresh load can clear a stuck client-side
-    hydration - rather than sitting on a page that may never finish.
-    Raises the underlying TimeoutError if it still isn't ready after all
-    attempts, same as before, so existing failure-artifact handling in the
-    caller still fires.
-    """
-    link_button = page.locator(CONFIG["LOCATOR_LINK_BUTTON_SELECTOR"])
-    for attempt in range(1, attempts + 1):
-        try:
-            await link_button.wait_for(state="visible", timeout=ready_timeout_ms)
-            log.info("Editor ready (attempt %d/%d).", attempt, attempts)
-            return
-        except Exception as e:
-            log.warning(
-                "Attempt %d/%d: editor toolbar not ready after %dms (%s)",
-                attempt, attempts, ready_timeout_ms, e,
-            )
-            if attempt == attempts:
-                # Out of attempts - let this real TimeoutError (with its
-                # own call-log context) propagate to the caller, same as
-                # before this fix existed.
-                raise
-            log.info("Reloading editor and retrying...")
-            await page.reload(wait_until="domcontentloaded")
-            await asyncio.sleep(2)
-            await _handle_cloudflare(page)
-
 
 async def _replace_link_in_editor(page: Page, new_link: str) -> None:
     """
@@ -252,39 +127,94 @@ async def _replace_link_in_editor(page: Page, new_link: str) -> None:
         CONFIG["LOCATOR_LINK_INPUT"]["role"],
         name=CONFIG["LOCATOR_LINK_INPUT"]["name"]
     ).fill(new_link)
-
-    # Quick, non-fatal look that the link actually landed in the input/
-    # editor before confirming. This is just a sanity glance - it never
-    # raises. We deliberately don't hard-fail here anymore: a network
-    # trace from a real run showed the save PATCH returning 200 well
-    # within the old 30s waits, while Patreon's own client-side signals
-    # (Update button spinner, link text appearing in page.content()) still
-    # looked like a failure. The user has seen the exact same thing doing
-    # this manually - Patreon's editor UI shows an error/stuck state even
-    # when the update actually went through. So the editor is no longer
-    # treated as the source of truth; it's just a quick look.
-    try:
-        await page.wait_for_function(
-            "(linkText) => document.body.innerHTML.includes(linkText)",
-            arg=new_link,
-            timeout=3000,
-        )
-        log.info("Link visible in editor before confirming.")
-    except Exception:
-        log.info("Link not visibly rendered yet - proceeding to confirm anyway.")
-
     await page.get_by_role(
         CONFIG["LOCATOR_UPDATE_BUTTON"]["role"],
         name=CONFIG["LOCATOR_UPDATE_BUTTON"]["name"]
     ).click()
 
-    # Fixed settle time and done - no post-Update verification here.
-    # The real check is the public-post verification in
-    # update_patreon_post(), which hits the actually-published page
-    # rather than trusting this editor's client-side state.
-    await asyncio.sleep(5)
-    log.info("Update clicked, settle wait complete.")
+    # DIAGNOSTIC: the previous version's two wait_for_function calls were
+    # wrapped in bare `except Exception: pass`, which hid what actually
+    # happened. The last real run showed the FIRST wait returning in 19ms
+    # (suspiciously fast - likely an immediate JS error, not a real result)
+    # and the SECOND wait genuinely burning the full 30s with the Update
+    # button still shown spinning afterward - i.e. Patreon's save request
+    # may be truly hanging, not just slow. Logging network activity here so
+    # the next failure shows exactly which request (if any) never resolves.
+    network_log = []
 
+    def _on_request(req):
+        if req.method == "POST" or "post" in req.url.lower() or "api" in req.url.lower():
+            network_log.append(f"-> {req.method} {req.url}")
+
+    def _on_response(res):
+        if res.request.method == "POST" or "post" in res.url.lower() or "api" in res.url.lower():
+            network_log.append(f"<- {res.status} {res.url}")
+
+    def _on_request_failed(req):
+        network_log.append(f"XX FAILED {req.method} {req.url} ({req.failure})")
+
+    page.on("request", _on_request)
+    page.on("response", _on_response)
+    page.on("requestfailed", _on_request_failed)
+
+    log.info("Waiting for link embed to resolve...")
+    try:
+        await page.wait_for_function(
+            "(linkText) => document.body.innerHTML.includes(linkText)",
+            arg=new_link,
+            timeout=30000,
+        )
+    except Exception as e:
+        log.warning("wait_for_function (embed resolve) did not confirm: %s", e)
+
+    log.info("Waiting for save (Update) request to complete...")
+    try:
+        await page.wait_for_function(
+            """() => {
+                const b = document.querySelector('button[data-tag="make-a-post-action-save"]');
+                return !b || !b.className.includes('isLoading');
+            }""",
+            timeout=30000,
+        )
+    except Exception as e:
+        log.warning("wait_for_function (save complete) did not confirm: %s", e)
+
+    page.remove_listener("request", _on_request)
+    page.remove_listener("response", _on_response)
+    page.remove_listener("requestfailed", _on_request_failed)
+
+    if network_log:
+        log.info("Network activity during Update wait:\n%s", "\n".join(network_log))
+    else:
+        log.warning(
+            "No POST/API network activity observed during the Update wait at all - "
+            "the save click may not be firing a request, or the proxy may be "
+            "swallowing it before it's visible to Playwright."
+        )
+
+    await asyncio.sleep(1)  # small settle buffer after both conditions clear
+
+    # FIX: previously this function just trusted that Link->fill->Update
+    # actually persisted the link, and the caller moved straight on to
+    # checking the *public* post - which then sat waiting on the full
+    # 90s nav timeout for a link that was never inserted in the first
+    # place. Check the editor DOM right here, immediately, so a broken
+    # insert flow fails in ~2 seconds with a screenshot showing exactly
+    # what the editor looked like, instead of stalling on verification.
+    editor_content = await page.content()
+    if new_link not in editor_content:
+        await page.screenshot(path="patreon_link_not_inserted.png", full_page=True)
+        with open("patreon_link_not_inserted.html", "w", encoding="utf-8") as f:
+            f.write(editor_content)
+        raise RuntimeError(
+            "Link does not appear in the editor after clicking Update - the "
+            "insert flow isn't persisting it (possibly needs selected text "
+            "first, or 'Update' here isn't the button that actually saves "
+            "it, or there's a separate top-level Publish/Save step). See "
+            "patreon_link_not_inserted.png / patreon_link_not_inserted.html "
+            "for the exact editor state at the point it failed."
+        )
+    log.info("Link confirmed present in editor DOM.")
 
 async def update_patreon_post(new_link: str) -> None:
     session_path = Path(CONFIG["SESSION_PATH"])
@@ -329,31 +259,15 @@ async def update_patreon_post(new_link: str) -> None:
             await asyncio.sleep(2)
 
             await _handle_cloudflare(page)
-
-            # FIX: previously went straight into _replace_link_in_editor()
-            # after just a fixed sleep(2) + Cloudflare title check, relying
-            # on Playwright's default 60s action-timeout as the only
-            # backstop against a slow-hydrating editor. A captured failure
-            # showed the page still full of skeleton placeholders 60+
-            # seconds in - the toolbar button genuinely wasn't there yet,
-            # not a selector problem. This waits for a real readiness
-            # signal and reloads once if it stalls, instead of gambling on
-            # a fixed sleep being long enough.
-            await _wait_for_editor_ready(page, edit_url)
-
             await _replace_link_in_editor(page, new_link)
 
             log.info("Verifying public post: %s", public_url)
-            # FIX: previously a single page.goto(..., wait_until=
-            # "domcontentloaded") using the full 90s NAV_TIMEOUT_MS. On the
-            # run that prompted this fix, that call hung for the entire 90s
-            # and threw a bare TimeoutError before the Cloudflare check (or
-            # any content check) ever ran. _goto_with_retries() replaces
-            # this with several shorter attempts and raises
-            # VerificationInconclusiveError specifically if none of them
-            # even produce a page - see below for why that distinction
-            # matters.
-            await _goto_with_retries(page, public_url)
+            await page.goto(public_url, wait_until="domcontentloaded")
+            # FIX: Cloudflare was only ever handled on the editor page. If a
+            # challenge shows up here too, the script previously had no way
+            # to solve it and would just sit until NAV_TIMEOUT_MS expired
+            # (up to 90s) - which is what looked like "stuck."
+            await _handle_cloudflare(page)
             log.info("Public post page loaded (title: %s)", await page.title())
             content = await page.content()
             if new_link not in content:
@@ -376,7 +290,6 @@ async def update_patreon_post(new_link: str) -> None:
             raise
         finally:
             await browser.close()
-
 
 def _disable_and_remove_old(old_path: str) -> None:
     import subprocess
@@ -412,7 +325,6 @@ def _disable_and_remove_old(old_path: str) -> None:
     except Exception as e:
         log.warning("Could not remove old folder %s: %s", old_path, e)
 
-
 def _rollback_sync(temp_path: str) -> None:
     import subprocess
     log.info("Rolling back: moving temp folder to bin: %s", temp_path)
@@ -426,7 +338,6 @@ def _rollback_sync(temp_path: str) -> None:
     except Exception as e:
         log.warning("Could not remove temp folder %s: %s", temp_path, e)
 
-
 async def main():
     log.info("=== Starting MEGA + Patreon link rotation ===")
     loop = asyncio.get_running_loop()
@@ -439,27 +350,6 @@ async def main():
 
     try:
         await update_patreon_post(new_link)
-    except VerificationInconclusiveError:
-        # FIX: this used to fall into the same bare `except Exception` as a
-        # confirmed content mismatch, which rolled back (deleted) the temp
-        # folder - i.e. threw away a link that, per the 2026-08-13 network
-        # trace, had almost certainly already saved successfully server-side.
-        # An inconclusive verification means we genuinely don't know whether
-        # the edit took, so the safe move is to do nothing destructive:
-        # leave the old export + old folder alone (still live, so the post
-        # is never link-less) and leave the new temp folder alone too (so
-        # nothing is lost if the edit did succeed). This just surfaces
-        # loudly and exits non-zero so it's visible in the Actions run,
-        # for manual confirmation - the live post should be checked by hand
-        # before the next scheduled run.
-        log.exception(
-            "Could not verify the public post (navigation never completed) - "
-            "NOT rolling back and NOT cleaning up. Old link is still live at "
-            "%s, new folder %s was left in place in case the edit actually "
-            "succeeded. Check the live post manually.",
-            old_path, temp_path,
-        )
-        sys.exit(2)
     except Exception:
         log.exception("Patreon update failed – rolling back (deleting temp folder)")
         await loop.run_in_executor(None, _rollback_sync, temp_path)
@@ -474,7 +364,6 @@ async def main():
     # folder lookup finds it by fixed name again.
     final_path = await loop.run_in_executor(None, finalize_active_folder, temp_path)
     log.info("=== Done. Old folder removed. Active folder is now: %s ===", final_path)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
