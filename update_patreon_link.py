@@ -164,7 +164,18 @@ async def _replace_link_in_editor(page: Page, new_link: str) -> None:
     log.info("Update clicked, settle wait complete.")
 
 
-async def update_patreon_post(new_link: str) -> None:
+class VerificationInconclusive(Exception):
+    """
+    Raised when we could not even load the public post page to check for
+    the link - as opposed to loading it successfully and finding the link
+    genuinely missing. This distinction matters: we now have solid
+    evidence (a real run's network trace) that the Patreon save itself
+    succeeds fast and reliably. A network/proxy blip on this GET request
+    is not evidence the update failed, and rolling back (trashing the temp
+    MEGA folder) in that case would discard a likely-good link based on
+    nothing but our own inability to check it.
+    """
+    pass
     session_path = Path(CONFIG["SESSION_PATH"])
     if not session_path.exists():
         raise FileNotFoundError(f"Session file not found: {session_path}")
@@ -210,11 +221,42 @@ async def update_patreon_post(new_link: str) -> None:
             await _replace_link_in_editor(page, new_link)
 
             log.info("Verifying public post: %s", public_url)
-            await page.goto(public_url, wait_until="domcontentloaded")
-            # FIX: Cloudflare was only ever handled on the editor page. If a
-            # challenge shows up here too, the script previously had no way
-            # to solve it and would just sit until NAV_TIMEOUT_MS expired
-            # (up to 90s) - which is what looked like "stuck."
+            # FIX: previously a single 90s goto() here that, if it timed
+            # out (real run: it did - a raw network stall, not a
+            # Cloudflare challenge, since domcontentloaded never fired at
+            # all), was treated identically to "loaded fine but link is
+            # genuinely missing" - both triggered a rollback. Retry the
+            # navigation itself a couple times first; a transient
+            # proxy/network blip right after heavy editor activity is a
+            # plausible one-off, not proof the update failed.
+            nav_attempts = 3
+            last_nav_error = None
+            for attempt in range(1, nav_attempts + 1):
+                try:
+                    await page.goto(public_url, wait_until="domcontentloaded")
+                    last_nav_error = None
+                    break
+                except Exception as e:
+                    last_nav_error = e
+                    log.warning(
+                        "Navigation to public post failed (attempt %d/%d): %s",
+                        attempt, nav_attempts, e,
+                    )
+                    if attempt < nav_attempts:
+                        await asyncio.sleep(5)
+
+            if last_nav_error is not None:
+                # Never even got the page loaded after retries - this is
+                # NOT the same as "link confirmed missing." Do not let the
+                # caller roll back the temp folder for this.
+                raise VerificationInconclusive(
+                    f"Could not load the public post page after {nav_attempts} "
+                    f"attempts (last error: {last_nav_error}). The Patreon "
+                    "update itself may well have succeeded - this is a "
+                    "verification failure, not a confirmed content mismatch. "
+                    "NOT rolling back the new MEGA folder."
+                )
+
             await _handle_cloudflare(page)
             log.info("Public post page loaded (title: %s)", await page.title())
             content = await page.content()
@@ -301,6 +343,24 @@ async def main():
 
     try:
         await update_patreon_post(new_link)
+    except VerificationInconclusive as e:
+        # We could not confirm success, but we also have no evidence of
+        # failure - the Patreon save itself has proven reliable in
+        # practice. Do NOT touch either MEGA folder: leave old_path (still
+        # exported, still working for anyone with the old link) and
+        # temp_path (holding the link we likely just set) both alone.
+        # Fail the job loudly so this run gets attention, but the safe
+        # next step is a human checking the live post, not the script
+        # guessing and potentially discarding a good link.
+        log.error(
+            "Could not verify the update, but NOT rolling back - the "
+            "underlying save has been reliable in practice and this looks "
+            "like a network/verification issue, not a content problem. "
+            "MANUAL CHECK NEEDED: %s -- old folder (%s) and temp folder "
+            "(%s) were both left untouched.",
+            e, old_path, temp_path,
+        )
+        raise
     except Exception:
         log.exception("Patreon update failed – rolling back (deleting temp folder)")
         await loop.run_in_executor(None, _rollback_sync, temp_path)
