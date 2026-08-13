@@ -25,16 +25,16 @@ jobs:
 
       - name: Install Python deps
         run: |
-          pip install -q -r requirements.txt
-          # Install both chromium and firefox
-          patchright install --with-deps chromium firefox
+          pip install -q playwright
+          # Only download headless-shell (much smaller than full Chromium)
+          playwright install --only-shell chromium
 
       - name: Restore Patreon session
         env:
           PATREON_SESSION_JSON: ${{ secrets.PATREON_SESSION_JSON }}
         run: |
-          echo "$PATREON_SESSION_JSON" > patreon_session.json
-          python -c "import json; json.load(open('patreon_session.json'))"
+          echo "$PATREON_SESSION_JSON" > patreon.json
+          python -c "import json; json.load(open('patreon.json'))"
 
       - name: mega-login
         env:
@@ -45,23 +45,8 @@ jobs:
       - name: Run rotation
         env:
           PATREON_POST_ID: ${{ secrets.PATREON_POST_ID }}
-          PROXY_HOST: ${{ secrets.PROXY_HOST }}
-          PROXY_PORT: ${{ secrets.PROXY_PORT }}
-          PROXY_USERNAME: ${{ secrets.PROXY_USERNAME }}
-          PROXY_PASSWORD: ${{ secrets.PROXY_PASSWORD }}
         run: python update_patreon_link.py
 
       - name: mega-logout
         if: always()
         run: mega-logout || true
-
-      - name: Upload failure artifacts
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-artifacts
-          path: |
-            patreon_failure.png
-            patreon_failure.html
-            cloudflare_failure.png
-            cloudflare_failure.html
