@@ -1,377 +1,186 @@
-import asyncio
+"""
+Rotates the MEGA link and updates an existing Patreon post's body text
+in place (no delete/recreate, so likes/comments are preserved).
+
+Uses Playwright with a saved session (patreon.json).
+Locators are ACCESSIBILITY‑TREE based (get_by_role) – stable across React builds.
+
+Direct DOM manipulation via evaluate() sets the new content and fires an input event
+to ensure React picks up the change.
+"""
+
 import logging
 import os
 import re
 import sys
 from pathlib import Path
-from typing import Optional
 
-from patchright.async_api import async_playwright, Page
-from playwright_captcha import CaptchaType, ClickSolver, FrameworkType
-from mega_rotate import rotate_mega_link, finalize_active_folder
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-# =========================== CONFIG ===========================
+from mega_rotate import rotate_mega_link
+
+# ============================== CONFIG ==============================
+
 CONFIG = {
-    "SESSION_PATH": "patreon_session.json",
+    "SESSION_PATH": "patreon.json",
+
     "POST_ID": os.environ.get("PATREON_POST_ID", "123456789"),
     "EDIT_URL": "https://www.patreon.com/posts/{post_id}/edit",
     "PUBLIC_URL": "https://www.patreon.com/posts/{post_id}",
 
     "MEGA_LINK_PATTERN": r"https://mega\.nz/folder/[A-Za-z0-9#_-]+",
 
-    "LOCATOR_KEBAB_BUTTON": {"role": "button", "name": "Menu for additional actions"},
-    "LOCATOR_DELETE_ITEM": {"role": "menuitem", "name": "Delete"},
-    "LOCATOR_CONFIRM_DELETE": {"role": "button", "name": "Delete"},
-    "LOCATOR_LINK_BUTTON_SELECTOR": "button:has-text('Link')",
-    "LOCATOR_LINK_INPUT": {"role": "textbox", "name": "Type or paste URL"},
-    "LOCATOR_UPDATE_BUTTON": {"role": "button", "name": "Update"},
+    # --- Locators: fill these in from `playwright codegen` ---
+    # Run:
+    #   playwright codegen https://www.patreon.com/posts/<POST_ID>/edit --load-storage=patreon.json
+    # Click the editor body, the Save button, and the success toast.
+    # Copy the role and accessible name it shows for each.
+    "LOCATOR_EDITOR_BODY":  {"role": "textbox", "name": re.compile(r".*", re.I)},   # PLACEHOLDER
+    "LOCATOR_SAVE_BUTTON":  {"role": "button",  "name": re.compile(r"save", re.I)}, # PLACEHOLDER
+    "LOCATOR_CONFIRMATION": {"role": "status",  "name": re.compile(r".*saved.*", re.I)}, # PLACEHOLDER
+
+    # Resource types and hosts to abort for speed
+    "BLOCK_RESOURCE_TYPES": {"image", "media", "font", "stylesheet"},
+    "BLOCK_HOST_SUBSTRINGS": [
+        "google-analytics.com", "googletagmanager.com", "doubleclick.net",
+        "facebook.net", "connect.facebook.com", "segment.io", "segment.com",
+        "sentry.io", "fullstory.com", "hotjar.com", "intercom.io",
+    ],
 
     "HEADLESS": True,
-    "NAV_TIMEOUT_MS": 90000,
-    "ACTION_TIMEOUT_MS": 60000,
+    "NAV_TIMEOUT_MS": 20_000,
+    "ACTION_TIMEOUT_MS": 10_000,
 }
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+# ======================================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    stream=sys.stdout,
+)
 log = logging.getLogger("patreon_update")
 
+def _install_fast_routing(page):
+    """Abort heavy/unneeded requests."""
+    block_types = CONFIG["BLOCK_RESOURCE_TYPES"]
+    block_hosts = CONFIG["BLOCK_HOST_SUBSTRINGS"]
 
-def _get_proxy_config() -> Optional[dict]:
-    host = os.getenv("PROXY_HOST")
-    port = os.getenv("PROXY_PORT")
-    username = os.getenv("PROXY_USERNAME")
-    password = os.getenv("PROXY_PASSWORD")
-    if host and port:
-        proxy = {"server": f"http://{host}:{port}"}
-        if username and password:
-            proxy["username"] = username
-            proxy["password"] = password
-        log.info(f"Using proxy: {proxy['server']}")
-        return proxy
-    log.warning("No proxy configured – using direct connection.")
-    return None
+    def handler(route):
+        req = route.request
+        if req.resource_type in block_types:
+            return route.abort()
+        if any(h in req.url for h in block_hosts):
+            return route.abort()
+        return route.continue_()
 
+    page.route("**/*", handler)
 
-async def _handle_cloudflare(page: Page) -> None:
-    title = await page.title()
-    if "Just a moment..." in title or "Checking your browser" in title:
-        log.info("Cloudflare challenge detected. Attempting bypass...")
-        solver = ClickSolver(
-            framework=FrameworkType.PATCHRIGHT,
-            page=page,
-            max_attempts=5,
-            attempt_delay=5,
-        )
-        try:
-            async with solver:
-                try:
-                    await solver.solve_captcha(
-                        captcha_container=page,
-                        captcha_type=CaptchaType.CLOUDFLARE_TURNSTILE
-                    )
-                except Exception:
-                    log.warning("Turnstile solver failed, trying Interstitial...")
-                    await solver.solve_captcha(
-                        captcha_container=page,
-                        captcha_type=CaptchaType.CLOUDFLARE_INTERSTITIAL
-                    )
-            log.info("Cloudflare challenge solved.")
-            await page.wait_for_load_state("networkidle", timeout=60000)
-            await asyncio.sleep(2)
-        except Exception as e:
-            await page.screenshot(path="cloudflare_failure.png", full_page=True)
-            with open("cloudflare_failure.html", "w", encoding="utf-8") as f:
-                f.write(await page.content())
-            raise RuntimeError(f"Cloudflare bypass failed: {e}")
-
-
-async def _replace_link_in_editor(page: Page, new_link: str) -> None:
-    """
-    Replaces the existing MEGA link with the new one.
-    If no existing link is found, skip deletion and just add a new link.
-    """
-    try:
-        # FIX: previously this built the selector as f"text=/{pattern}/",
-        # but MEGA_LINK_PATTERN itself contains literal "/" characters
-        # (https://mega.nz/folder/...), which breaks Playwright's
-        # "text=/regex/" delimiter parsing. That made this lookup fail
-        # silently every time (caught below), so has_link was always
-        # False and the old link was never actually deleted before
-        # adding the new one. Passing a compiled regex to get_by_text()
-        # avoids the string-delimiter problem entirely.
-        link_element = page.get_by_text(re.compile(CONFIG["MEGA_LINK_PATTERN"])).first
-        await link_element.wait_for(state="attached", timeout=2000)
-        has_link = True
-    except Exception:
-        has_link = False
-
-    if has_link:
-        log.info("Existing MEGA link found. Deleting it...")
-        await page.get_by_role(
-            CONFIG["LOCATOR_KEBAB_BUTTON"]["role"],
-            name=CONFIG["LOCATOR_KEBAB_BUTTON"]["name"]
-        ).click()
-
-        await page.get_by_role(
-            CONFIG["LOCATOR_DELETE_ITEM"]["role"],
-            name=CONFIG["LOCATOR_DELETE_ITEM"]["name"]
-        ).click()
-
-        await page.get_by_role(
-            CONFIG["LOCATOR_CONFIRM_DELETE"]["role"],
-            name=CONFIG["LOCATOR_CONFIRM_DELETE"]["name"]
-        ).click()
-        log.info("Link deleted.")
-    else:
-        log.info("No existing MEGA link found. Skipping deletion.")
-
-    log.info("Adding new link...")
-    await page.locator(CONFIG["LOCATOR_LINK_BUTTON_SELECTOR"]).click()
-    await page.get_by_role(
-        CONFIG["LOCATOR_LINK_INPUT"]["role"],
-        name=CONFIG["LOCATOR_LINK_INPUT"]["name"]
-    ).fill(new_link)
-    await page.get_by_role(
-        CONFIG["LOCATOR_UPDATE_BUTTON"]["role"],
-        name=CONFIG["LOCATOR_UPDATE_BUTTON"]["name"]
-    ).click()
-
-    # DIAGNOSTIC: the previous version's two wait_for_function calls were
-    # wrapped in bare `except Exception: pass`, which hid what actually
-    # happened. The last real run showed the FIRST wait returning in 19ms
-    # (suspiciously fast - likely an immediate JS error, not a real result)
-    # and the SECOND wait genuinely burning the full 30s with the Update
-    # button still shown spinning afterward - i.e. Patreon's save request
-    # may be truly hanging, not just slow. Logging network activity here so
-    # the next failure shows exactly which request (if any) never resolves.
-    network_log = []
-
-    def _on_request(req):
-        if req.method == "POST" or "post" in req.url.lower() or "api" in req.url.lower():
-            network_log.append(f"-> {req.method} {req.url}")
-
-    def _on_response(res):
-        if res.request.method == "POST" or "post" in res.url.lower() or "api" in res.url.lower():
-            network_log.append(f"<- {res.status} {res.url}")
-
-    def _on_request_failed(req):
-        network_log.append(f"XX FAILED {req.method} {req.url} ({req.failure})")
-
-    page.on("request", _on_request)
-    page.on("response", _on_response)
-    page.on("requestfailed", _on_request_failed)
-
-    log.info("Waiting for link embed to resolve...")
-    try:
-        await page.wait_for_function(
-            "(linkText) => document.body.innerHTML.includes(linkText)",
-            arg=new_link,
-            timeout=30000,
-        )
-    except Exception as e:
-        log.warning("wait_for_function (embed resolve) did not confirm: %s", e)
-
-    log.info("Waiting for save (Update) request to complete...")
-    try:
-        await page.wait_for_function(
-            """() => {
-                const b = document.querySelector('button[data-tag="make-a-post-action-save"]');
-                return !b || !b.className.includes('isLoading');
-            }""",
-            timeout=30000,
-        )
-    except Exception as e:
-        log.warning("wait_for_function (save complete) did not confirm: %s", e)
-
-    page.remove_listener("request", _on_request)
-    page.remove_listener("response", _on_response)
-    page.remove_listener("requestfailed", _on_request_failed)
-
-    if network_log:
-        log.info("Network activity during Update wait:\n%s", "\n".join(network_log))
-    else:
-        log.warning(
-            "No POST/API network activity observed during the Update wait at all - "
-            "the save click may not be firing a request, or the proxy may be "
-            "swallowing it before it's visible to Playwright."
-        )
-
-    await asyncio.sleep(1)  # small settle buffer after both conditions clear
-
-    # FIX: previously this function just trusted that Link->fill->Update
-    # actually persisted the link, and the caller moved straight on to
-    # checking the *public* post - which then sat waiting on the full
-    # 90s nav timeout for a link that was never inserted in the first
-    # place. Check the editor DOM right here, immediately, so a broken
-    # insert flow fails in ~2 seconds with a screenshot showing exactly
-    # what the editor looked like, instead of stalling on verification.
-    editor_content = await page.content()
-    if new_link not in editor_content:
-        await page.screenshot(path="patreon_link_not_inserted.png", full_page=True)
-        with open("patreon_link_not_inserted.html", "w", encoding="utf-8") as f:
-            f.write(editor_content)
-        raise RuntimeError(
-            "Link does not appear in the editor after clicking Update - the "
-            "insert flow isn't persisting it (possibly needs selected text "
-            "first, or 'Update' here isn't the button that actually saves "
-            "it, or there's a separate top-level Publish/Save step). See "
-            "patreon_link_not_inserted.png / patreon_link_not_inserted.html "
-            "for the exact editor state at the point it failed."
-        )
-    log.info("Link confirmed present in editor DOM.")
-
-
-async def update_patreon_post(new_link: str) -> None:
+def update_patreon_post(new_link: str) -> None:
     session_path = Path(CONFIG["SESSION_PATH"])
     if not session_path.exists():
         raise FileNotFoundError(f"Session file not found: {session_path}")
 
     edit_url = CONFIG["EDIT_URL"].format(post_id=CONFIG["POST_ID"])
     public_url = CONFIG["PUBLIC_URL"].format(post_id=CONFIG["POST_ID"])
-    proxy_config = _get_proxy_config()
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=CONFIG["HEADLESS"],
-            args=[
-                "--no-sandbox",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",
-                "--disable-setuid-sandbox",
-                "--window-size=1920,1080",
-                "--disable-features=IsolateOrigins,site-per-process",
-            ]
-        )
-        context = await browser.new_context(
-            storage_state=str(session_path),
-            viewport={"width": 1920, "height": 1080},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/151.0.0.0 Safari/537.36"
-            ),
-            proxy=proxy_config,
-            locale="en-US",
-            timezone_id="America/New_York",
-        )
-        page = await context.new_page()
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=CONFIG["HEADLESS"])
+        context = browser.new_context(storage_state=str(session_path))
+        page = context.new_page()
         page.set_default_timeout(CONFIG["ACTION_TIMEOUT_MS"])
         page.set_default_navigation_timeout(CONFIG["NAV_TIMEOUT_MS"])
+        _install_fast_routing(page)
 
         try:
-            log.info("Opening editor: %s", edit_url)
-            await page.goto(edit_url, wait_until="domcontentloaded")
-            await asyncio.sleep(2)
+            log.info("Step A: opening editor %s", edit_url)
+            page.goto(edit_url, wait_until="domcontentloaded")
 
-            await _handle_cloudflare(page)
-            await _replace_link_in_editor(page, new_link)
+            log.info("Step B: locating editor body via role ...")
+            loc = CONFIG["LOCATOR_EDITOR_BODY"]
+            editor = page.get_by_role(loc["role"], name=loc["name"])
+            editor.wait_for(state="visible")
 
-            log.info("Verifying public post: %s", public_url)
-            await page.goto(public_url, wait_until="domcontentloaded")
-            # FIX: Cloudflare was only ever handled on the editor page. If a
-            # challenge shows up here too, the script previously had no way
-            # to solve it and would just sit until NAV_TIMEOUT_MS expired
-            # (up to 90s) - which is what looked like "stuck."
-            await _handle_cloudflare(page)
-            log.info("Public post page loaded (title: %s)", await page.title())
-            content = await page.content()
-            if new_link not in content:
+            # 1. Get current content (HTML for contenteditable, value for textarea)
+            current_html = editor.evaluate("el => el.innerHTML")  # works for both
+            if not re.search(CONFIG["MEGA_LINK_PATTERN"], current_html):
                 raise RuntimeError(
-                    "Verification failed: new link not found on live post. "
+                    "No existing MEGA link found in post body. Check pattern or post content."
+                )
+
+            new_html = re.sub(CONFIG["MEGA_LINK_PATTERN"], new_link, current_html)
+
+            log.info("Step C: replacing link directly via evaluate() ...")
+            # Set the new content and trigger an input event so React picks it up
+            editor.evaluate(f"""
+                (el) => {{
+                    el.innerHTML = `{new_html}`;
+                    el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                }}
+            """)
+
+            # Optional: wait a moment for React to settle
+            page.wait_for_timeout(500)
+
+            log.info("Step D: saving ...")
+            save_loc = CONFIG["LOCATOR_SAVE_BUTTON"]
+            page.get_by_role(save_loc["role"], name=save_loc["name"]).click()
+
+            # Wait for the confirmation toast / status message
+            conf_loc = CONFIG["LOCATOR_CONFIRMATION"]
+            page.get_by_role(conf_loc["role"], name=conf_loc["name"]).wait_for(state="visible")
+            log.info("Step D: save confirmed.")
+
+            log.info("Step E: verifying live post at %s ...", public_url)
+            page.goto(public_url, wait_until="domcontentloaded")
+            # Wait for the post content to load (body might be lazy)
+            page.wait_for_selector("article", timeout=5000).or_(page.wait_for_selector("div[data-testid='post-content']"))
+            page_content = page.content()
+            if new_link not in page_content:
+                raise RuntimeError(
+                    "Verification failed: new link not present on live post. "
                     "NOT cleaning up old MEGA folder."
                 )
-            log.info("Verification passed – new link is live.")
+            log.info("Step E: verified.")
 
-        except Exception:
-            try:
-                await page.screenshot(path="patreon_failure.png", full_page=True)
-            except Exception:
-                pass
-            try:
-                with open("patreon_failure.html", "w", encoding="utf-8") as f:
-                    f.write(await page.content())
-            except Exception:
-                pass
-            raise
+        except PWTimeout as e:
+            raise RuntimeError(f"Timed out waiting on a locator: {e}") from e
         finally:
-            await browser.close()
+            context.close()
+            browser.close()
 
-
-def _disable_and_remove_old(old_path: str) -> None:
-    import subprocess
-    log.info("Disabling old export and removing folder: %s", old_path)
-    try:
-        subprocess.run(
-            ["mega-export", "-d", old_path],
-            input="yes\n", capture_output=True, text=True, timeout=15,
-        )
-    except Exception as e:
-        log.warning("Could not disable export on %s (may already be disabled): %s", old_path, e)
-
-    # FIX: mega-rm -r is a synchronous, permanent delete that blocks until
-    # the whole recursive removal finishes server-side - that's what was
-    # hanging for minutes. Moving to the Rubbish Bin (//bin/) is a single
-    # lightweight call, effectively instant - the same thing a manual
-    # "delete" in the web/app actually does. Falls back to mega-rm -r only
-    # if the move itself fails.
-    try:
-        subprocess.run(
-            ["mega-mv", old_path, "//bin/"],
-            capture_output=True, text=True, timeout=20,
-        )
-        log.info("Old folder moved to Rubbish Bin: %s", old_path)
-        return
-    except Exception as e:
-        log.warning("Move-to-bin failed for %s (%s), falling back to mega-rm -r", old_path, e)
-    try:
-        subprocess.run(
-            ["mega-rm", "-r", old_path],
-            capture_output=True, text=True, timeout=90,
-        )
-    except Exception as e:
-        log.warning("Could not remove old folder %s: %s", old_path, e)
-
-
-def _rollback_sync(temp_path: str) -> None:
-    import subprocess
-    log.info("Rolling back: moving temp folder to bin: %s", temp_path)
-    try:
-        subprocess.run(["mega-mv", temp_path, "//bin/"], capture_output=True, text=True, timeout=20)
-        return
-    except Exception as e:
-        log.warning("Move-to-bin failed for %s (%s), falling back to mega-rm -r", temp_path, e)
-    try:
-        subprocess.run(["mega-rm", "-r", temp_path], capture_output=True, text=True, timeout=90)
-    except Exception as e:
-        log.warning("Could not remove temp folder %s: %s", temp_path, e)
-
-
-async def main():
+def main():
     log.info("=== Starting MEGA + Patreon link rotation ===")
-    loop = asyncio.get_running_loop()
-    new_link, old_path, temp_path = await loop.run_in_executor(
-        None, rotate_mega_link
-    )
+    new_link, old_path, old_name, temp_path = rotate_mega_link()
     log.info("New MEGA link ready: %s", new_link)
-    log.info("Old folder (still active): %s", old_path)
-    log.info("Temp folder (to keep if update succeeds, delete if fails): %s", temp_path)
 
     try:
-        await update_patreon_post(new_link)
+        update_patreon_post(new_link)
     except Exception:
-        log.exception("Patreon update failed – rolling back (deleting temp folder)")
-        await loop.run_in_executor(None, _rollback_sync, temp_path)
+        log.exception("Patreon update failed -- rolling back temp folder %s", temp_path)
+        _rollback(temp_path)
         raise
 
     log.info("Verified. Cleaning up old folder %s", old_path)
-    await loop.run_in_executor(None, _disable_and_remove_old, old_path)
+    _cleanup_old(old_path)
+    log.info("=== Done. Old export at %s disabled. ===", old_name)
 
-    # FIX: this step didn't exist before, which is why the fixed folder
-    # name never came back after a successful rotation. Renames the temp
-    # folder back to FOLDER_FIXED_NAME (if configured) so next run's
-    # folder lookup finds it by fixed name again.
-    final_path = await loop.run_in_executor(None, finalize_active_folder, temp_path)
-    log.info("=== Done. Old folder removed. Active folder is now: %s ===", final_path)
+def _rollback(temp_path: str) -> None:
+    import subprocess
+    subprocess.run(["mega-rm", "-r", temp_path], capture_output=True, text=True)
 
+def _cleanup_old(old_path: str) -> None:
+    import subprocess
+    subprocess.run(["mega-export", "-d", old_path], capture_output=True, text=True)
+    subprocess.run(["mega-rm", "-r", old_path], capture_output=True, text=True)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
+
+# ======================================================================
+# How to get real locator values:
+#   playwright codegen https://www.patreon.com/posts/<POST_ID>/edit \
+#       --load-storage=patreon.json
+# Click the editor, Save button, and success toast.
+# Copy the role + name that appear in the recorder.
+# ======================================================================
