@@ -60,8 +60,7 @@ def _delete_folder(path: str) -> None:
     lightweight "change parent" call, effectively instant - it's what
     the web/app "delete" button actually does too. That's enough for our
     purposes: the folder just needs to disappear from MEGA_BASE_DIR so it
-    stops being picked up as a stale candidate. Actual space is reclaimed
-    later by _empty_trash_background().
+    stops being picked up as a stale candidate.
     """
     print(f"Moving stale folder to Rubbish Bin: {path}", flush=True)
     try:
@@ -74,26 +73,6 @@ def _delete_folder(path: str) -> None:
     except Exception as e:
         # A single stuck/failed stale-folder deletion shouldn't take down the whole rotation.
         print(f"WARNING: failed to delete {path}: {e}", flush=True)
-
-
-def _empty_trash_background() -> None:
-    """
-    Fire-and-forget purge of the Rubbish Bin. This is the slow, permanent
-    delete - we don't want to wait on it (that's the whole problem we just
-    fixed), so it's launched detached and never joined. Safe to skip
-    entirely if it fails to launch.
-    """
-    try:
-        subprocess.Popen(
-            ["mega-rm", "-r", "-f", "//bin/*"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-        print("Rubbish Bin purge kicked off in the background.", flush=True)
-    except Exception as e:
-        print(f"Note: could not kick off background trash purge: {e}", flush=True)
 
 
 def _find_active_folder() -> str:
@@ -137,9 +116,7 @@ def _find_active_folder() -> str:
         _disable_export_quiet(stale_path)
         _delete_folder(stale_path)
 
-    if stale:
-        _empty_trash_background()
-
+    # Auto‑purge of the Rubbish Bin has been removed – you can empty it manually.
     return active_name
 
 
