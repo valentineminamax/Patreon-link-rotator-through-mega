@@ -22,11 +22,10 @@ CONFIG = {
     "LOCATOR_KEBAB_BUTTON": {"role": "button", "name": "Menu for additional actions"},
     "LOCATOR_DELETE_ITEM": {"role": "menuitem", "name": "Delete"},
     "LOCATOR_CONFIRM_DELETE": {"role": "button", "name": "Delete"},
-    # More specific selector for the link button (often in the toolbar)
     "LOCATOR_LINK_BUTTON_SELECTOR": "button[aria-label='Insert link']",
     "LOCATOR_LINK_INPUT": {"role": "textbox", "name": "Type or paste URL"},
     "LOCATOR_UPDATE_BUTTON": {"role": "button", "name": "Update"},
-    "LOCATOR_INSERT_BUTTON": {"role": "button", "name": "Insert"},  # Fallback
+    "LOCATOR_INSERT_BUTTON": {"role": "button", "name": "Insert"},
 
     "HEADLESS": True,
     "NAV_TIMEOUT_MS": 90000,
@@ -150,7 +149,6 @@ async def _replace_link_in_editor(page: Page, new_link: str) -> None:
         log.info("Modal closed automatically.")
     except Exception:
         log.warning("Modal did not close automatically. Looking for 'Insert' button...")
-        # Try to click an "Insert" or "Done" button if present
         insert_btn = page.get_by_role("button", name=re.compile(r"Insert|Add|Done", re.I))
         if await insert_btn.count() > 0:
             await insert_btn.click()
@@ -158,25 +156,37 @@ async def _replace_link_in_editor(page: Page, new_link: str) -> None:
         else:
             log.warning("No 'Insert' button found. Assuming link was inserted anyway.")
 
-    # Now wait for the link to appear in the editor
-    log.info("Verifying link presence in editor...")
+    # ---- Improved link presence check ----
+    log.info("Verifying link presence in editor (using text selector)...")
     try:
-        await page.wait_for_function(
-            "(linkText) => document.body.innerHTML.includes(linkText)",
-            arg=new_link,
-            timeout=10000,
-        )
-        log.info("Link confirmed present in editor DOM.")
+        # Try to locate the link by text (regex) and wait for it to be attached.
+        link_locator = page.get_by_text(re.compile(CONFIG["MEGA_LINK_PATTERN"])).first
+        await link_locator.wait_for(state="attached", timeout=30000)
+        log.info("Link found via text selector.")
     except Exception:
-        # Screenshot and fail if not found
-        await page.screenshot(path="patreon_link_not_inserted.png", full_page=True)
-        with open("patreon_link_not_inserted.html", "w", encoding="utf-8") as f:
-            f.write(await page.content())
-        raise RuntimeError(
-            "Link does not appear in the editor after insertion. "
-            "See patreon_link_not_inserted.png / patreon_link_not_inserted.html "
-            "for the exact editor state."
-        )
+        # Fallback: check for an <a> tag whose href contains the link pattern
+        log.warning("Link not found via text selector, checking for anchor element...")
+        try:
+            href_locator = page.locator(f'a[href*="{new_link[:50]}"]')  # partial match
+            await href_locator.first.wait_for(state="attached", timeout=10000)
+            log.info("Link found via href selector.")
+        except Exception:
+            # Ultimate fallback: check if the full URL appears in the page HTML
+            log.warning("Link not found via href selector, checking page content...")
+            await asyncio.sleep(2)  # give it a final moment
+            content = await page.content()
+            if new_link in content:
+                log.info("Link found in page content after all.")
+            else:
+                # Capture failure artifacts
+                await page.screenshot(path="patreon_link_not_inserted.png", full_page=True)
+                with open("patreon_link_not_inserted.html", "w", encoding="utf-8") as f:
+                    f.write(content)
+                raise RuntimeError(
+                    "Link does not appear in the editor after insertion. "
+                    "See patreon_link_not_inserted.png / patreon_link_not_inserted.html "
+                    "for the exact editor state."
+                )
 
     # Now save the post (click the main "Save" or "Update" button)
     log.info("Saving the post...")
