@@ -154,6 +154,58 @@ async def _goto_with_retries(
     )
 
 
+async def _wait_for_editor_ready(
+    page: Page,
+    edit_url: str,
+    attempts: int = 2,
+    ready_timeout_ms: int = 30000,
+) -> None:
+    """
+    Wait for the post editor to actually finish hydrating before touching
+    it, instead of trusting a fixed sleep(2).
+
+    FIX (2026-08-13): the previous code did `goto(edit_url,
+    wait_until="domcontentloaded")` + `sleep(2)` + a Cloudflare title check,
+    then went straight for the "Link" toolbar button, relying on Playwright's
+    default 60s action-timeout as the only backstop. A captured failure
+    screenshot showed the page still full of grey shimmer/skeleton
+    placeholders 60+ seconds after that goto - the document had loaded
+    (title was plain "Patreon", no Cloudflare interstitial, ~387KB of real
+    payload) but Patreon's client-side app simply hadn't rendered the real
+    editor yet. The click didn't fail because the selector was wrong; there
+    was nothing there yet to click.
+
+    This waits explicitly for the Link toolbar button to become visible
+    (the actual signal we care about, not a guess at how long hydration
+    takes). If it's not visible within ready_timeout_ms, it reloads the
+    page once and tries again - a fresh load can clear a stuck client-side
+    hydration - rather than sitting on a page that may never finish.
+    Raises the underlying TimeoutError if it still isn't ready after all
+    attempts, same as before, so existing failure-artifact handling in the
+    caller still fires.
+    """
+    link_button = page.locator(CONFIG["LOCATOR_LINK_BUTTON_SELECTOR"])
+    for attempt in range(1, attempts + 1):
+        try:
+            await link_button.wait_for(state="visible", timeout=ready_timeout_ms)
+            log.info("Editor ready (attempt %d/%d).", attempt, attempts)
+            return
+        except Exception as e:
+            log.warning(
+                "Attempt %d/%d: editor toolbar not ready after %dms (%s)",
+                attempt, attempts, ready_timeout_ms, e,
+            )
+            if attempt == attempts:
+                # Out of attempts - let this real TimeoutError (with its
+                # own call-log context) propagate to the caller, same as
+                # before this fix existed.
+                raise
+            log.info("Reloading editor and retrying...")
+            await page.reload(wait_until="domcontentloaded")
+            await asyncio.sleep(2)
+            await _handle_cloudflare(page)
+
+
 async def _replace_link_in_editor(page: Page, new_link: str) -> None:
     """
     Replaces the existing MEGA link with the new one.
@@ -277,6 +329,18 @@ async def update_patreon_post(new_link: str) -> None:
             await asyncio.sleep(2)
 
             await _handle_cloudflare(page)
+
+            # FIX: previously went straight into _replace_link_in_editor()
+            # after just a fixed sleep(2) + Cloudflare title check, relying
+            # on Playwright's default 60s action-timeout as the only
+            # backstop against a slow-hydrating editor. A captured failure
+            # showed the page still full of skeleton placeholders 60+
+            # seconds in - the toolbar button genuinely wasn't there yet,
+            # not a selector problem. This waits for a real readiness
+            # signal and reloads once if it stalls, instead of gambling on
+            # a fixed sleep being long enough.
+            await _wait_for_editor_ready(page, edit_url)
+
             await _replace_link_in_editor(page, new_link)
 
             log.info("Verifying public post: %s", public_url)
