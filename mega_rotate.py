@@ -1,349 +1,203 @@
-import asyncio
-import logging
-import os
+"""
+Rotates the MEGA public link - with rollback and auto-cleanup of stale folders.
+The old folder's export is NOT disabled until Patreon update succeeds.
+If multiple folders exist, keep the active one and delete the rest.
+"""
+
+import subprocess
+import time
 import re
-import sys
-from pathlib import Path
-from typing import Optional
-
-from patchright.async_api import async_playwright, Page
-from playwright_captcha import CaptchaType, ClickSolver, FrameworkType
-from mega_rotate import rotate_mega_link, finalize_active_folder
-
-# =========================== CONFIG ===========================
-CONFIG = {
-    "SESSION_PATH": "patreon_session.json",
-    "POST_ID": os.environ.get("PATREON_POST_ID", "123456789"),
-    "EDIT_URL": "https://www.patreon.com/posts/{post_id}/edit",
-    "PUBLIC_URL": "https://www.patreon.com/posts/{post_id}",
-
-    "MEGA_LINK_PATTERN": r"https://mega\.nz/folder/[A-Za-z0-9#_-]+",
-
-    "LOCATOR_KEBAB_BUTTON": {"role": "button", "name": "Menu for additional actions"},
-    "LOCATOR_DELETE_ITEM": {"role": "menuitem", "name": "Delete"},
-    "LOCATOR_CONFIRM_DELETE": {"role": "button", "name": "Delete"},
-    "LOCATOR_LINK_BUTTON_SELECTOR": "button:has-text('Link')",
-    "LOCATOR_LINK_INPUT": {"role": "textbox", "name": "Type or paste URL"},
-    "LOCATOR_UPDATE_BUTTON": {"role": "button", "name": "Update"},
-
-    "HEADLESS": True,
-    "NAV_TIMEOUT_MS": 90000,
-    "ACTION_TIMEOUT_MS": 60000,
-}
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("patreon_update")
+from config import MEGA_BASE_DIR, FOLDER_PREFIX, FOLDER_FIXED_NAME
 
 
-def _get_proxy_config() -> Optional[dict]:
-    host = os.getenv("PROXY_HOST")
-    port = os.getenv("PROXY_PORT")
-    username = os.getenv("PROXY_USERNAME")
-    password = os.getenv("PROXY_PASSWORD")
-    if host and port:
-        proxy = {"server": f"http://{host}:{port}"}
-        if username and password:
-            proxy["username"] = username
-            proxy["password"] = password
-        log.info(f"Using proxy: {proxy['server']}")
-        return proxy
-    log.warning("No proxy configured – using direct connection.")
-    return None
-
-
-async def _handle_cloudflare(page: Page) -> None:
-    title = await page.title()
-    if "Just a moment..." in title or "Checking your browser" in title:
-        log.info("Cloudflare challenge detected. Attempting bypass...")
-        solver = ClickSolver(
-            framework=FrameworkType.PATCHRIGHT,
-            page=page,
-            max_attempts=5,
-            attempt_delay=5,
-        )
-        try:
-            async with solver:
-                try:
-                    await solver.solve_captcha(
-                        captcha_container=page,
-                        captcha_type=CaptchaType.CLOUDFLARE_TURNSTILE
-                    )
-                except Exception:
-                    log.warning("Turnstile solver failed, trying Interstitial...")
-                    await solver.solve_captcha(
-                        captcha_container=page,
-                        captcha_type=CaptchaType.CLOUDFLARE_INTERSTITIAL
-                    )
-            log.info("Cloudflare challenge solved.")
-            await page.wait_for_load_state("networkidle", timeout=60000)
-            await asyncio.sleep(2)
-        except Exception as e:
-            await page.screenshot(path="cloudflare_failure.png", full_page=True)
-            with open("cloudflare_failure.html", "w", encoding="utf-8") as f:
-                f.write(await page.content())
-            raise RuntimeError(f"Cloudflare bypass failed: {e}")
-
-
-async def _replace_link_in_editor(page: Page, new_link: str) -> None:
-    """
-    Replaces the existing MEGA link with the new one.
-    If no existing link is found, skip deletion and just add a new link.
-    """
-    try:
-        # FIX: previously this built the selector as f"text=/{pattern}/",
-        # but MEGA_LINK_PATTERN itself contains literal "/" characters
-        # (https://mega.nz/folder/...), which breaks Playwright's
-        # "text=/regex/" delimiter parsing. That made this lookup fail
-        # silently every time (caught below), so has_link was always
-        # False and the old link was never actually deleted before
-        # adding the new one. Passing a compiled regex to get_by_text()
-        # avoids the string-delimiter problem entirely.
-        link_element = page.get_by_text(re.compile(CONFIG["MEGA_LINK_PATTERN"])).first
-        await link_element.wait_for(state="attached", timeout=2000)
-        has_link = True
-    except Exception:
-        has_link = False
-
-    if has_link:
-        log.info("Existing MEGA link found. Deleting it...")
-        await page.get_by_role(
-            CONFIG["LOCATOR_KEBAB_BUTTON"]["role"],
-            name=CONFIG["LOCATOR_KEBAB_BUTTON"]["name"]
-        ).click()
-
-        await page.get_by_role(
-            CONFIG["LOCATOR_DELETE_ITEM"]["role"],
-            name=CONFIG["LOCATOR_DELETE_ITEM"]["name"]
-        ).click()
-
-        await page.get_by_role(
-            CONFIG["LOCATOR_CONFIRM_DELETE"]["role"],
-            name=CONFIG["LOCATOR_CONFIRM_DELETE"]["name"]
-        ).click()
-        log.info("Link deleted.")
-    else:
-        log.info("No existing MEGA link found. Skipping deletion.")
-
-    log.info("Adding new link...")
-    await page.locator(CONFIG["LOCATOR_LINK_BUTTON_SELECTOR"]).click()
-    await page.get_by_role(
-        CONFIG["LOCATOR_LINK_INPUT"]["role"],
-        name=CONFIG["LOCATOR_LINK_INPUT"]["name"]
-    ).fill(new_link)
-    await page.get_by_role(
-        CONFIG["LOCATOR_UPDATE_BUTTON"]["role"],
-        name=CONFIG["LOCATOR_UPDATE_BUTTON"]["name"]
-    ).click()
-
-    # FIX: a flat 2s sleep here was the actual root cause of the
-    # "link not inserted" failures - not a bad selector. Two things
-    # happen asynchronously after this click: (1) Patreon fetches embed
-    # metadata for the MEGA URL (the dashed placeholder box + spinner you
-    # see immediately after clicking), and (2) the post save request
-    # itself, which puts the Update button into a loading state
-    # (class containing "isLoading", data-tag="make-a-post-action-save" -
-    # confirmed from the captured failure HTML). 2s wasn't enough for
-    # either. Wait for both to actually finish instead of guessing a
-    # sleep duration.
-    log.info("Waiting for link embed to resolve...")
-    try:
-        await page.wait_for_function(
-            "(linkText) => document.body.innerHTML.includes(linkText)",
-            arg=new_link,
-            timeout=30000,
-        )
-    except Exception:
-        pass  # fall through to the explicit check below for a clear error + screenshot
-
-    log.info("Waiting for save (Update) request to complete...")
-    try:
-        await page.wait_for_function(
-            """() => {
-                const b = document.querySelector('button[data-tag="make-a-post-action-save"]');
-                return !b || !b.className.includes('isLoading');
-            }""",
-            timeout=30000,
-        )
-    except Exception:
-        pass
-
-    await asyncio.sleep(1)  # small settle buffer after both conditions clear
-
-    # FIX: previously this function just trusted that Link->fill->Update
-    # actually persisted the link, and the caller moved straight on to
-    # checking the *public* post - which then sat waiting on the full
-    # 90s nav timeout for a link that was never inserted in the first
-    # place. Check the editor DOM right here, immediately, so a broken
-    # insert flow fails in ~2 seconds with a screenshot showing exactly
-    # what the editor looked like, instead of stalling on verification.
-    editor_content = await page.content()
-    if new_link not in editor_content:
-        await page.screenshot(path="patreon_link_not_inserted.png", full_page=True)
-        with open("patreon_link_not_inserted.html", "w", encoding="utf-8") as f:
-            f.write(editor_content)
-        raise RuntimeError(
-            "Link does not appear in the editor after clicking Update - the "
-            "insert flow isn't persisting it (possibly needs selected text "
-            "first, or 'Update' here isn't the button that actually saves "
-            "it, or there's a separate top-level Publish/Save step). See "
-            "patreon_link_not_inserted.png / patreon_link_not_inserted.html "
-            "for the exact editor state at the point it failed."
-        )
-    log.info("Link confirmed present in editor DOM.")
-
-
-async def update_patreon_post(new_link: str) -> None:
-    session_path = Path(CONFIG["SESSION_PATH"])
-    if not session_path.exists():
-        raise FileNotFoundError(f"Session file not found: {session_path}")
-
-    edit_url = CONFIG["EDIT_URL"].format(post_id=CONFIG["POST_ID"])
-    public_url = CONFIG["PUBLIC_URL"].format(post_id=CONFIG["POST_ID"])
-    proxy_config = _get_proxy_config()
-
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=CONFIG["HEADLESS"],
-            args=[
-                "--no-sandbox",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",
-                "--disable-setuid-sandbox",
-                "--window-size=1920,1080",
-                "--disable-features=IsolateOrigins,site-per-process",
-            ]
-        )
-        context = await browser.new_context(
-            storage_state=str(session_path),
-            viewport={"width": 1920, "height": 1080},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/151.0.0.0 Safari/537.36"
-            ),
-            proxy=proxy_config,
-            locale="en-US",
-            timezone_id="America/New_York",
-        )
-        page = await context.new_page()
-        page.set_default_timeout(CONFIG["ACTION_TIMEOUT_MS"])
-        page.set_default_navigation_timeout(CONFIG["NAV_TIMEOUT_MS"])
-
-        try:
-            log.info("Opening editor: %s", edit_url)
-            await page.goto(edit_url, wait_until="domcontentloaded")
-            await asyncio.sleep(2)
-
-            await _handle_cloudflare(page)
-            await _replace_link_in_editor(page, new_link)
-
-            log.info("Verifying public post: %s", public_url)
-            await page.goto(public_url, wait_until="domcontentloaded")
-            # FIX: Cloudflare was only ever handled on the editor page. If a
-            # challenge shows up here too, the script previously had no way
-            # to solve it and would just sit until NAV_TIMEOUT_MS expired
-            # (up to 90s) - which is what looked like "stuck."
-            await _handle_cloudflare(page)
-            log.info("Public post page loaded (title: %s)", await page.title())
-            content = await page.content()
-            if new_link not in content:
-                raise RuntimeError(
-                    "Verification failed: new link not found on live post. "
-                    "NOT cleaning up old MEGA folder."
-                )
-            log.info("Verification passed – new link is live.")
-
-        except Exception:
-            try:
-                await page.screenshot(path="patreon_failure.png", full_page=True)
-            except Exception:
-                pass
-            try:
-                with open("patreon_failure.html", "w", encoding="utf-8") as f:
-                    f.write(await page.content())
-            except Exception:
-                pass
-            raise
-        finally:
-            await browser.close()
-
-
-def _disable_and_remove_old(old_path: str) -> None:
-    import subprocess
-    log.info("Disabling old export and removing folder: %s", old_path)
-    try:
-        subprocess.run(
-            ["mega-export", "-d", old_path],
-            input="yes\n", capture_output=True, text=True, timeout=15,
-        )
-    except Exception as e:
-        log.warning("Could not disable export on %s (may already be disabled): %s", old_path, e)
-
-    # FIX: mega-rm -r is a synchronous, permanent delete that blocks until
-    # the whole recursive removal finishes server-side - that's what was
-    # hanging for minutes. Moving to the Rubbish Bin (//bin/) is a single
-    # lightweight call, effectively instant - the same thing a manual
-    # "delete" in the web/app actually does. Falls back to mega-rm -r only
-    # if the move itself fails.
-    try:
-        subprocess.run(
-            ["mega-mv", old_path, "//bin/"],
-            capture_output=True, text=True, timeout=20,
-        )
-        log.info("Old folder moved to Rubbish Bin: %s", old_path)
-        return
-    except Exception as e:
-        log.warning("Move-to-bin failed for %s (%s), falling back to mega-rm -r", old_path, e)
-    try:
-        subprocess.run(
-            ["mega-rm", "-r", old_path],
-            capture_output=True, text=True, timeout=90,
-        )
-    except Exception as e:
-        log.warning("Could not remove old folder %s: %s", old_path, e)
-
-
-def _rollback_sync(temp_path: str) -> None:
-    import subprocess
-    log.info("Rolling back: moving temp folder to bin: %s", temp_path)
-    try:
-        subprocess.run(["mega-mv", temp_path, "//bin/"], capture_output=True, text=True, timeout=20)
-        return
-    except Exception as e:
-        log.warning("Move-to-bin failed for %s (%s), falling back to mega-rm -r", temp_path, e)
-    try:
-        subprocess.run(["mega-rm", "-r", temp_path], capture_output=True, text=True, timeout=90)
-    except Exception as e:
-        log.warning("Could not remove temp folder %s: %s", temp_path, e)
-
-
-async def main():
-    log.info("=== Starting MEGA + Patreon link rotation ===")
-    loop = asyncio.get_running_loop()
-    new_link, old_path, temp_path = await loop.run_in_executor(
-        None, rotate_mega_link
+def _run(cmd, stdin_input=None, timeout=120):
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, input=stdin_input, timeout=timeout
     )
-    log.info("New MEGA link ready: %s", new_link)
-    log.info("Old folder (still active): %s", old_path)
-    log.info("Temp folder (to keep if update succeeds, delete if fails): %s", temp_path)
+    if result.returncode != 0:
+        print(f"Command failed: {' '.join(cmd)}", flush=True)
+        print(f"stdout: {result.stdout}", flush=True)
+        print(f"stderr: {result.stderr}", flush=True)
+        raise subprocess.CalledProcessError(result.returncode, cmd, result.stdout, result.stderr)
+    return result
 
+
+def _list_base_dir() -> list[str]:
+    result = subprocess.run(
+        ["mega-ls", MEGA_BASE_DIR], capture_output=True, text=True, timeout=60
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"mega-ls failed (exit {result.returncode}) — this usually means "
+            "you're not logged in (`mega-login`) or MEGAcmd isn't on PATH yet, "
+            f"not that the folder is missing.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+    return [line.strip().rstrip("/") for line in result.stdout.splitlines() if line.strip()]
+
+
+def _extract_timestamp(name: str) -> int:
+    match = re.search(rf'{re.escape(FOLDER_PREFIX)}(\d+)', name)
+    if match:
+        return int(match.group(1))
+    return 0
+
+
+def _disable_export_quiet(path: str) -> None:
+    """Best-effort: disable a folder's export link. Never raises/hangs the run."""
     try:
-        await update_patreon_post(new_link)
-    except Exception:
-        log.exception("Patreon update failed – rolling back (deleting temp folder)")
-        await loop.run_in_executor(None, _rollback_sync, temp_path)
-        raise
+        _run(["mega-export", "-d", path], stdin_input="yes\n", timeout=15)
+    except Exception as e:
+        print(f"Note: could not disable export on {path} (may already be disabled): {e}", flush=True)
 
-    log.info("Verified. Cleaning up old folder %s", old_path)
-    await loop.run_in_executor(None, _disable_and_remove_old, old_path)
 
-    # FIX: this step didn't exist before, which is why the fixed folder
-    # name never came back after a successful rotation. Renames the temp
-    # folder back to FOLDER_FIXED_NAME (if configured) so next run's
-    # folder lookup finds it by fixed name again.
-    final_path = await loop.run_in_executor(None, finalize_active_folder, temp_path)
-    log.info("=== Done. Old folder removed. Active folder is now: %s ===", final_path)
+def _delete_folder(path: str) -> None:
+    """
+    Get a stale folder out of MEGA_BASE_DIR fast.
+
+    mega-rm -r does a synchronous, permanent delete and blocks until the
+    whole recursive removal finishes server-side - that's the multi-minute
+    hang you were seeing. Moving to the Rubbish Bin (//bin/) is a single
+    lightweight "change parent" call, effectively instant - it's what
+    the web/app "delete" button actually does too. That's enough for our
+    purposes: the folder just needs to disappear from MEGA_BASE_DIR so it
+    stops being picked up as a stale candidate. Actual space is reclaimed
+    later by _empty_trash_background().
+    """
+    print(f"Moving stale folder to Rubbish Bin: {path}", flush=True)
+    try:
+        _run(["mega-mv", path, "//bin/"], timeout=20)
+        return
+    except Exception as e:
+        print(f"Note: move-to-bin failed for {path} ({e}), falling back to mega-rm -r", flush=True)
+    try:
+        _run(["mega-rm", "-r", path], timeout=90)
+    except Exception as e:
+        # A single stuck/failed stale-folder deletion shouldn't take down the whole rotation.
+        print(f"WARNING: failed to delete {path}: {e}", flush=True)
+
+
+def _empty_trash_background() -> None:
+    """
+    Fire-and-forget purge of the Rubbish Bin. This is the slow, permanent
+    delete - we don't want to wait on it (that's the whole problem we just
+    fixed), so it's launched detached and never joined. Safe to skip
+    entirely if it fails to launch.
+    """
+    try:
+        subprocess.Popen(
+            ["mega-rm", "-r", "-f", "//bin/*"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        print("Rubbish Bin purge kicked off in the background.", flush=True)
+    except Exception as e:
+        print(f"Note: could not kick off background trash purge: {e}", flush=True)
+
+
+def _find_active_folder() -> str:
+    """
+    Find the active folder and clean up any stale ones.
+
+    - If FOLDER_FIXED_NAME exists, it IS the active folder. Any leftover
+      FOLDER_PREFIX-timestamped folders are stale remnants of a previous
+      rotation (e.g. one that crashed before it could rename/delete) and
+      are cleaned up here. Previously this branch returned immediately and
+      never reached the cleanup logic at all, which is why stale folders
+      kept piling up.
+    - Otherwise, the newest FOLDER_PREFIX-timestamped folder is treated as
+      active, and every other timestamped folder is stale and deleted.
+    """
+    entries = _list_base_dir()
+    candidates = [e for e in entries if e.startswith(FOLDER_PREFIX)]
+
+    if FOLDER_FIXED_NAME and FOLDER_FIXED_NAME in entries:
+        active_name = FOLDER_FIXED_NAME
+        stale = candidates
+    else:
+        if len(candidates) == 0:
+            raise RuntimeError(
+                f"No folder starting with '{FOLDER_PREFIX}' found under {MEGA_BASE_DIR}, "
+                f"and FOLDER_FIXED_NAME ('{FOLDER_FIXED_NAME}') was not found either. "
+                f"mega-ls returned: {entries}. Check config.py."
+            )
+        candidates_with_ts = [(name, _extract_timestamp(name)) for name in candidates]
+        candidates_with_ts = [(n, ts) for n, ts in candidates_with_ts if ts > 0]
+        if not candidates_with_ts:
+            raise RuntimeError("No valid timestamp found in folder names.")
+        candidates_with_ts.sort(key=lambda x: x[1], reverse=True)
+        active_name = candidates_with_ts[0][0]
+        stale = [n for n, _ in candidates_with_ts[1:]]
+
+    if stale:
+        print(f"Found {len(stale)} stale folder(s) to clean up: {stale}", flush=True)
+    for stale_name in stale:
+        stale_path = f"{MEGA_BASE_DIR}/{stale_name}"
+        _disable_export_quiet(stale_path)
+        _delete_folder(stale_path)
+
+    if stale:
+        _empty_trash_background()
+
+    return active_name
+
+
+def rotate_mega_link() -> tuple[str, str, str]:
+    """
+    Returns: (new_link, old_path, temp_path)
+    - old_path: the previously-active folder, to delete once the Patreon
+      update succeeds
+    - temp_path: timestamped folder holding the new export; delete it on
+      rollback, or pass it to finalize_active_folder() on success
+    NOTE: the old folder's export is left active - we disable it only
+    after the Patreon update is verified.
+    """
+    active_name = _find_active_folder()
+    old_path = f"{MEGA_BASE_DIR}/{active_name}"
+
+    timestamp = int(time.time())
+    temp_name = f"{FOLDER_PREFIX}{timestamp}"
+    temp_path = f"{MEGA_BASE_DIR}/{temp_name}"
+
+    print(f"Step 1/3: copying {old_path} -> {temp_path} ...", flush=True)
+    _run(["mega-cp", old_path, temp_path])
+    print("Step 1/3: copy done.", flush=True)
+
+    print("Step 2/3: generating new export link on temp folder ...", flush=True)
+    result = _run(["mega-export", "-a", temp_path], stdin_input="yes\nyes\nyes\n")
+    for line in result.stdout.splitlines():
+        if "https://mega.nz" in line:
+            link = line.strip().split()[-1]
+            print(f"Step 2/3: new link generated: {link}", flush=True)
+            break
+    else:
+        raise RuntimeError("Could not parse new MEGA link from mega-export output:\n" + result.stdout)
+
+    # DO NOT disable old export yet - we keep it alive until Patreon succeeds
+    print("Step 3/3: old export remains active (safe).", flush=True)
+
+    return link, old_path, temp_path
+
+
+def finalize_active_folder(temp_path: str) -> str:
+    """
+    Call this AFTER old_path has been deleted and the Patreon post has
+    been verified live with the new link.
+
+    If FOLDER_FIXED_NAME is configured, renames temp_path -> FOLDER_FIXED_NAME
+    so the *next* run's _find_active_folder() finds it by fixed name again
+    (this is the step that was previously missing entirely).
+    Returns the final path of the active folder.
+    """
+    if not FOLDER_FIXED_NAME:
+        return temp_path
+
+    final_path = f"{MEGA_BASE_DIR}/{FOLDER_FIXED_NAME}"
+    print(f"Renaming {temp_path} -> {final_path} ...", flush=True)
+    _run(["mega-mv", temp_path, final_path])
+    return final_path
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    print(rotate_mega_link())
