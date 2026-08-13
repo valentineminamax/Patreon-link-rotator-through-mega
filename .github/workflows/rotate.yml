@@ -26,7 +26,7 @@ jobs:
       - name: Install Python deps
         run: |
           pip install -q playwright
-          # Only download headless-shell (much smaller than full Chromium)
+          # Only download headless‑shell (much smaller)
           playwright install --only-shell chromium
 
       - name: Restore Patreon session
