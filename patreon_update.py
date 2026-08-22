@@ -15,18 +15,20 @@ Behavior:
   upload them as evidence.
 - The proxy (if configured) is applied ONLY to this Chromium instance -
   it's the only traffic in the whole run that needs to look residential.
+- Added stealth evasion to bypass Cloudflare challenges using playwright-stealth.
 """
 
 import json
 import os
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright_stealth import stealth_sync  # <-- new import
 
 import config
 
 # How long to wait to see if a link block's menu button is present before
 # concluding there's no existing link to delete.
-LINK_DETECT_TIMEOUT_MS = 5000
+LINK_DETECT_TIMEOUT_MS = 8000  # increased from 5000 for Cloudflare
 POST_UPDATE_SETTLE_MS = 5000
 
 
@@ -69,7 +71,15 @@ def update_patreon_link(new_link: str, screenshot_dir: str = "artifacts") -> Non
     proxy = _proxy_settings()
 
     with sync_playwright() as playwright:
-        launch_kwargs = {"headless": True}
+        launch_kwargs = {
+            "headless": True,
+            "args": [
+                "--disable-blink-features=AutomationControlled",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--disable-web-security",          # sometimes helps with iframes
+                "--disable-site-isolation-trials",
+            ],
+        }
         if proxy:
             launch_kwargs["proxy"] = proxy
             print(f"Launching Chromium with proxy: {proxy['server']}", flush=True)
@@ -77,12 +87,23 @@ def update_patreon_link(new_link: str, screenshot_dir: str = "artifacts") -> Non
             print("No proxy configured - launching Chromium directly.", flush=True)
 
         browser = playwright.chromium.launch(**launch_kwargs)
-        context = browser.new_context(storage_state=storage_state)
+        # Realistic user-agent to avoid detection
+        user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        context = browser.new_context(storage_state=storage_state, user_agent=user_agent)
         page = context.new_page()
+
+        # Apply stealth to hide automation fingerprints
+        stealth_sync(page)
 
         try:
             print(f"Opening post editor: {config.PATREON_POST_URL}", flush=True)
-            page.goto(config.PATREON_POST_URL, wait_until="load", timeout=45000)
+            page.goto(config.PATREON_POST_URL, wait_until="load", timeout=60000)  # increased timeout
+
+            # Wait for any Cloudflare challenge to resolve (network idle)
+            try:
+                page.wait_for_load_state("networkidle", timeout=15000)
+            except PlaywrightTimeoutError:
+                print("Network idle timeout – proceeding anyway.", flush=True)
 
             # Diagnostic snapshot BEFORE anything else - if the proxy or
             # session is bad, this tells us what actually rendered (a
