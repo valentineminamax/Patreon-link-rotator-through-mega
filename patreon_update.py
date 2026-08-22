@@ -72,7 +72,7 @@ def update_patreon_link(new_link: str, screenshot_dir: str = "artifacts") -> Non
         launch_kwargs = {"headless": True}
         if proxy:
             launch_kwargs["proxy"] = proxy
-            print("Launching Chromium with proxy for the Patreon session.", flush=True)
+            print(f"Launching Chromium with proxy: {proxy['server']}", flush=True)
         else:
             print("No proxy configured - launching Chromium directly.", flush=True)
 
@@ -82,7 +82,15 @@ def update_patreon_link(new_link: str, screenshot_dir: str = "artifacts") -> Non
 
         try:
             print(f"Opening post editor: {config.PATREON_POST_URL}", flush=True)
-            page.goto(config.PATREON_POST_URL, wait_until="domcontentloaded")
+            page.goto(config.PATREON_POST_URL, wait_until="load", timeout=45000)
+
+            # Diagnostic snapshot BEFORE anything else - if the proxy or
+            # session is bad, this tells us what actually rendered (a
+            # Patreon login screen, a proxy error page, a Cloudflare
+            # challenge, truly blank, etc.) instead of just "it failed".
+            print(f"Landed on: {page.url}", flush=True)
+            print(f"Page title: {page.title()!r}", flush=True)
+            _dump_debug(page, screenshot_dir, "patreon_after_goto")
 
             menu_button = page.get_by_role("button", name="Menu for additional actions")
             try:
