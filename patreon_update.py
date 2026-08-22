@@ -15,14 +15,14 @@ Behavior:
   upload them as evidence.
 - The proxy (if configured) is applied ONLY to this Chromium instance -
   it's the only traffic in the whole run that needs to look residential.
-- Uses browser launch flags and a realistic user‑agent to reduce Cloudflare
-  detection (no extra dependencies).
+- Uses playwright-stealth and browser launch flags to reduce Cloudflare detection.
 """
 
 import json
 import os
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright_stealth import stealth_sync  # <-- 新增导入
 
 import config
 
@@ -93,6 +93,9 @@ def update_patreon_link(new_link: str, screenshot_dir: str = "artifacts") -> Non
         user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         context = browser.new_context(storage_state=storage_state, user_agent=user_agent)
         page = context.new_page()
+
+        # 应用 stealth 插件来隐藏自动化特征
+        stealth_sync(page)
 
         try:
             print(f"Opening post editor: {config.PATREON_POST_URL}", flush=True)
