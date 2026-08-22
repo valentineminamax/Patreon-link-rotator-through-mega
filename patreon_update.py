@@ -15,14 +15,14 @@ Behavior:
   upload them as evidence.
 - The proxy (if configured) is applied ONLY to this Chromium instance -
   it's the only traffic in the whole run that needs to look residential.
-- Added stealth evasion to bypass Cloudflare challenges using playwright-stealth.
+- Uses browser launch flags and a realistic user‑agent to reduce Cloudflare
+  detection (no extra dependencies).
 """
 
 import json
 import os
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
-from playwright_stealth import stealth_sync  # <-- new import
 
 import config
 
@@ -76,8 +76,10 @@ def update_patreon_link(new_link: str, screenshot_dir: str = "artifacts") -> Non
             "args": [
                 "--disable-blink-features=AutomationControlled",
                 "--disable-features=IsolateOrigins,site-per-process",
-                "--disable-web-security",          # sometimes helps with iframes
+                "--disable-web-security",
                 "--disable-site-isolation-trials",
+                "--no-sandbox",                     # often required in CI environments
+                "--disable-dev-shm-usage",          # avoid out-of-memory in containers
             ],
         }
         if proxy:
@@ -92,12 +94,9 @@ def update_patreon_link(new_link: str, screenshot_dir: str = "artifacts") -> Non
         context = browser.new_context(storage_state=storage_state, user_agent=user_agent)
         page = context.new_page()
 
-        # Apply stealth to hide automation fingerprints
-        stealth_sync(page)
-
         try:
             print(f"Opening post editor: {config.PATREON_POST_URL}", flush=True)
-            page.goto(config.PATREON_POST_URL, wait_until="load", timeout=60000)  # increased timeout
+            page.goto(config.PATREON_POST_URL, wait_until="load", timeout=60000)
 
             # Wait for any Cloudflare challenge to resolve (network idle)
             try:
@@ -105,10 +104,7 @@ def update_patreon_link(new_link: str, screenshot_dir: str = "artifacts") -> Non
             except PlaywrightTimeoutError:
                 print("Network idle timeout – proceeding anyway.", flush=True)
 
-            # Diagnostic snapshot BEFORE anything else - if the proxy or
-            # session is bad, this tells us what actually rendered (a
-            # Patreon login screen, a proxy error page, a Cloudflare
-            # challenge, truly blank, etc.) instead of just "it failed".
+            # Diagnostic snapshot
             print(f"Landed on: {page.url}", flush=True)
             print(f"Page title: {page.title()!r}", flush=True)
             _dump_debug(page, screenshot_dir, "patreon_after_goto")
@@ -134,8 +130,6 @@ def update_patreon_link(new_link: str, screenshot_dir: str = "artifacts") -> Non
             url_box.fill(new_link)
             page.get_by_role("button", name="Update").click()
 
-            # The Update button sometimes navigates, sometimes just settles
-            # in place - a short fixed wait covers both cases reliably.
             page.wait_for_timeout(POST_UPDATE_SETTLE_MS)
 
             _dump_debug(page, screenshot_dir, "patreon_update_success")
