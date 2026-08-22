@@ -1,67 +1,65 @@
-name: Rotate MEGA link + update Patreon post
+name: Rotate MEGA Link
 
 on:
-  schedule:
-    - cron: "0 */4 * * *"
   workflow_dispatch: {}
+  schedule:
+    # Adjust to taste - every 12 hours by default.
+    - cron: "0 */12 * * *"
 
 jobs:
   rotate:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.11"
 
+      # Playwright download + browser binaries go over GitHub's own network,
+      # never through the paid proxy - the proxy is only wired up inside
+      # patreon_update.py at browser-launch time.
+      - name: Install Python dependencies
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+
+      # MEGAcmd is a separate apt package; mega-login/mega-cp/etc. talk to
+      # MEGA directly from the runner's own IP, also bypassing the proxy.
       - name: Install MEGAcmd
         run: |
-          wget -q https://mega.nz/linux/repo/xUbuntu_22.04/amd64/megacmd-xUbuntu_22.04_amd64.deb
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ./megacmd-xUbuntu_22.04_amd64.deb
-
-      - name: Install Python deps
-        run: |
-          pip install -q -r requirements.txt
-          # Install both chromium and firefox
-          patchright install --with-deps chromium firefox
-
-      - name: Restore Patreon session
-        env:
-          PATREON_SESSION_JSON: ${{ secrets.PATREON_SESSION_JSON }}
-        run: |
-          echo "$PATREON_SESSION_JSON" > patreon_session.json
-          python -c "import json; json.load(open('patreon_session.json'))"
-
-      - name: mega-login
-        env:
-          MEGA_EMAIL: ${{ secrets.MEGA_EMAIL }}
-          MEGA_PASSWORD: ${{ secrets.MEGA_PASSWORD }}
-        run: mega-login "$MEGA_EMAIL" "$MEGA_PASSWORD"
+          wget -q https://mega.nz/linux/repo/xUbuntu_22.04/amd64/megacmd-xUbuntu_22.04_amd64.deb -O megacmd.deb
+          sudo apt-get update -y
+          sudo apt-get install -y ./megacmd.deb
 
       - name: Run rotation
         env:
-          PATREON_POST_ID: ${{ secrets.PATREON_POST_ID }}
+          MEGA_EMAIL: ${{ secrets.MEGA_EMAIL }}
+          MEGA_PASSWORD: ${{ secrets.MEGA_PASSWORD }}
+          PATREON_SESSION_JSON: ${{ secrets.PATREON_SESSION_JSON }}
+          PATREON_POST_URL: ${{ vars.PATREON_POST_URL }}
           PROXY_HOST: ${{ secrets.PROXY_HOST }}
           PROXY_PORT: ${{ secrets.PROXY_PORT }}
           PROXY_USERNAME: ${{ secrets.PROXY_USERNAME }}
           PROXY_PASSWORD: ${{ secrets.PROXY_PASSWORD }}
-        run: python update_patreon_link.py
+          # Not sensitive — set these under Settings > Secrets and
+          # variables > Actions > Variables (the "Variables" tab, not
+          # "Secrets"). If a variable isn't set, the fallback default in
+          # config.py is used instead.
+          MEGA_BASE_DIR: ${{ vars.MEGA_BASE_DIR }}
+          FOLDER_PREFIX: ${{ vars.FOLDER_PREFIX }}
+          FOLDER_FIXED_NAME: ${{ vars.FOLDER_FIXED_NAME }}
+        run: python main.py
 
-      - name: mega-logout
-        if: always()
-        run: mega-logout || true
-
-      - name: Upload failure artifacts
+      - name: Upload failure evidence
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: debug-artifacts
-          path: |
-            patreon_failure.png
-            patreon_failure.html
-            cloudflare_failure.png
-            cloudflare_failure.html
+          name: rotation-failure-evidence-${{ github.run_id }}
+          path: artifacts/
+          retention-days: 14
+          if-no-files-found: ignore
