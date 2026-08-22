@@ -1,41 +1,28 @@
 name: Rotate MEGA Link
-
 on:
   workflow_dispatch: {}
   schedule:
-    # Adjust to taste - every 12 hours by default.
     - cron: "0 */12 * * *"
-
 jobs:
   rotate:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      # Playwright download + browser binaries go over GitHub's own network,
-      # never through the paid proxy - the proxy is only wired up inside
-      # patreon_update.py at browser-launch time.
       - name: Install Python dependencies
         run: |
-          pip install playwright
+          pip install -r requirements.txt
           playwright install --with-deps chromium
-
-      # MEGAcmd is a separate apt package; mega-login/mega-cp/etc. talk to
-      # MEGA directly from the runner's own IP, also bypassing the proxy.
       - name: Install MEGAcmd
         run: |
           wget -q https://mega.nz/linux/repo/xUbuntu_22.04/amd64/megacmd-xUbuntu_22.04_amd64.deb -O megacmd.deb
           sudo apt-get update -y
           sudo apt-get install -y ./megacmd.deb
-
       - name: Run rotation
         env:
           MEGA_EMAIL: ${{ secrets.MEGA_EMAIL }}
@@ -46,15 +33,10 @@ jobs:
           PROXY_PORT: ${{ secrets.PROXY_PORT }}
           PROXY_USERNAME: ${{ secrets.PROXY_USERNAME }}
           PROXY_PASSWORD: ${{ secrets.PROXY_PASSWORD }}
-          # Not sensitive — set these under Settings > Secrets and
-          # variables > Actions > Variables (the "Variables" tab, not
-          # "Secrets"). If a variable isn't set, the fallback default in
-          # config.py is used instead.
           MEGA_BASE_DIR: ${{ vars.MEGA_BASE_DIR }}
           FOLDER_PREFIX: ${{ vars.FOLDER_PREFIX }}
           FOLDER_FIXED_NAME: ${{ vars.FOLDER_FIXED_NAME }}
         run: python main.py
-
       - name: Upload failure evidence
         if: failure()
         uses: actions/upload-artifact@v4
